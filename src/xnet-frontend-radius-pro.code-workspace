@@ -20,6 +20,12 @@
         },
         {
             "path": "../../iptv-app"
+        },
+        {
+            "path": "../../../Users/User/.cloudflared"
+        },
+        {
+            "path": "../../xnet-frontend-radius-pro.__clone"
         }
     ]
 }
