@@ -3,10 +3,19 @@ import { Request, Response } from "express";
 import {
   bulkPayInvoices, generateMonthlyInvoices,
   getAllExternalInvoices, getAllInvoices,
-  payInvoice, payExternalInvoice, replaceExternalInvoices,
+  payInvoice, payExternalInvoice,
+  upsertExternalInvoices,
+  enrichExternalInvoicesFromUserDetails,
+  applyDefaultPayDueDates,
+  inheritPayDueDatesFromPriorUnpaid,
+  normalizeBillingMonthKey,
+  normalizeDebitLabel,
+  createExternalInvoiceDebit,
+  getExternalInvoicePaymentLines,
   updateExternalInvoice,
   deleteExternalInvoice,
   bulkDeleteExternalInvoices,
+  bulkUpdateExternalInvoices,
   collectInvoice,
   reconcileInvoiceCash,
   reconcileBulkCash,
@@ -674,6 +683,15 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
       return null;
     };
 
+    const pickRowDebitLabel = (row: Record<string, unknown>): string =>
+      normalizeDebitLabel(
+        row.debitLabel ??
+          row.debit ??
+          row.DebitLabel ??
+          (row as { "Debit Label"?: unknown })["Debit Label"] ??
+          ''
+      );
+
     // Optional: validate/transform
     const invoices = raw.map((row: any) => {
       console.log(`row: ${JSON.stringify(row)}`);
@@ -705,6 +723,7 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
         phoneNumber: row.phoneNumber,
         address: pickRowAddress(row),
         payDueDate: parsePayDueFromRow(row),
+        debitLabel: pickRowDebitLabel(row),
         billingMonth: billingDate,
         amount: parseFloat(row.amount || 30),
         status: row.status || "pending",
@@ -724,10 +743,45 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
     });
     console.log(`Filtered out ${invoices.length - filteredInvoices.length} invoice(s) ending with 'xn'`);
 
-    await replaceExternalInvoices(filteredInvoices);
+    const enrichedFromUserDetails = await enrichExternalInvoicesFromUserDetails(filteredInvoices);
+
+    const inheritPayDue =
+      req.body?.inheritPayDue !== 'false' &&
+      req.body?.inheritPayDue !== false &&
+      String(req.body?.inheritPayDue ?? 'true').toLowerCase() !== 'false';
+
+    let inheritedPayDueDates = 0;
+    if (inheritPayDue) {
+      const repo = AppDataSource.getRepository(ExternalInvoice);
+      const currentRows = await repo.find();
+      inheritedPayDueDates = inheritPayDueDatesFromPriorUnpaid(filteredInvoices, currentRows);
+    }
+
+    const payDueDayOffsetRaw = req.body?.payDueDayOffset;
+    if (payDueDayOffsetRaw !== undefined && payDueDayOffsetRaw !== null && String(payDueDayOffsetRaw).trim() !== '') {
+      const payDueDayOffset = parseInt(String(payDueDayOffsetRaw), 10);
+      if (Number.isFinite(payDueDayOffset) && payDueDayOffset >= 0) {
+        applyDefaultPayDueDates(filteredInvoices, payDueDayOffset);
+      }
+    }
+
+    const scopedBillingMonths = monthOverride
+      ? [monthOverride]
+      : [...new Set(filteredInvoices.map((i) => normalizeBillingMonthKey(i.billingMonth as string)))];
+
+    const upsertResult = await upsertExternalInvoices(filteredInvoices, {
+      scopedBillingMonths,
+      actorUsername: req.user?.username,
+    });
+    upsertResult.enrichedFromUserDetails = enrichedFromUserDetails;
+    upsertResult.inheritedPayDueDates = inheritedPayDueDates;
 
     fs.unlinkSync(filePath); // cleanup
-    res.status(200).json({ success: true, message: "Invoices uploaded successfully" });
+    res.status(200).json({
+      success: true,
+      message: "Invoices uploaded successfully",
+      data: upsertResult,
+    });
   } catch (err) {
     console.error("Upload error:", err);
     res.status(500).json({ success: false, message: "Failed to upload invoice file" });
@@ -766,6 +820,72 @@ export const bulkDeleteExternalInvoicesHandler = async (req: Request, res: Respo
   }
 };
 
+export const bulkUpdateExternalInvoicesHandler = async (req: Request, res: Response) => {
+  try {
+    const invoiceIds = req.body?.invoiceIds;
+    if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
+      return sendResponse(res, false, 400, "invoiceIds must be a non-empty array");
+    }
+
+    const { payDueDate, address } = req.body ?? {};
+    if (payDueDate === undefined && address === undefined) {
+      return sendResponse(res, false, 400, "Provide payDueDate and/or address to update");
+    }
+
+    const updateData: Partial<Pick<ExternalInvoice, 'payDueDate' | 'address'>> = {};
+    if (payDueDate !== undefined) {
+      updateData.payDueDate =
+        payDueDate === null || String(payDueDate).trim() === '' ? null : String(payDueDate).slice(0, 10);
+    }
+    if (address !== undefined) {
+      updateData.address = address === null ? null : String(address);
+    }
+
+    const result = await bulkUpdateExternalInvoices(invoiceIds, updateData, req.user?.username || 'system');
+    sendResponse(res, true, 200, "External invoices updated successfully", result);
+  } catch (error) {
+    console.error("Error bulk updating external invoices:", error);
+    res.status(500).json({ message: "Failed to bulk update external invoices" });
+  }
+};
+
+export const getExternalInvoicePaymentLinesHandler = async (req: Request, res: Response) => {
+  try {
+    const username = String(req.query.username || '').trim();
+    const billingMonth = String(req.query.billingMonth || '').trim();
+    const provider = String(req.query.provider || '').trim() || undefined;
+    if (!username || !billingMonth) {
+      return sendResponse(res, false, 400, "username and billingMonth are required");
+    }
+    const lines = await getExternalInvoicePaymentLines(username, billingMonth, provider);
+    sendResponse(res, true, 200, "Payment lines fetched", lines);
+  } catch (error) {
+    console.error("Error fetching payment lines:", error);
+    res.status(500).json({ message: "Failed to fetch payment lines" });
+  }
+};
+
+export const createExternalInvoiceDebitHandler = async (req: Request, res: Response) => {
+  try {
+    const { sourceInvoiceId, username, billingMonth, provider, debitLabel, amount, payDueDate, status } = req.body ?? {};
+    const invoice = await createExternalInvoiceDebit({
+      sourceInvoiceId: sourceInvoiceId ? parseInt(String(sourceInvoiceId), 10) : undefined,
+      username,
+      billingMonth,
+      provider,
+      debitLabel,
+      amount: parseFloat(String(amount)),
+      payDueDate,
+      status,
+      actorUsername: req.user?.username || 'system',
+    });
+    sendResponse(res, true, 201, "Payment line created", invoice);
+  } catch (error: any) {
+    console.error("Error creating payment line:", error);
+    sendResponse(res, false, 400, error?.message || "Failed to create payment line");
+  }
+};
+
 export const getExternalInvoicesHandler = async (req: Request, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
@@ -778,8 +898,9 @@ export const getExternalInvoicesHandler = async (req: Request, res: Response) =>
     const graceDays = Math.max(0, parseIntOrDefault(req.query.graceDays, 7));
     const sortBy = (req.query.sortBy as 'createdAt' | 'billingMonth' | 'amount') || 'createdAt';
     const sortDir = ((req.query.sortDir as string)?.toUpperCase() === 'ASC' ? 'ASC' : 'DESC') as 'ASC' | 'DESC';
+    const missingData = (req.query.missing as string) || undefined;
 
-    const result = await getAllExternalInvoices(page, limit, search, from, to, status, sortBy, sortDir, false, ageBucket, graceDays);
+    const result = await getAllExternalInvoices(page, limit, search, from, to, status, sortBy, sortDir, false, ageBucket, graceDays, missingData);
     sendResponse(res, true, 200, "External invoices fetched successfully", result);
   } catch (err) {
     console.error("Error fetching external invoices:", err);

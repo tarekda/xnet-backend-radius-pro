@@ -1,6 +1,6 @@
 // src/services/invoice.service.ts
 import { AppDataSource } from '../db/config';
-import { In, SelectQueryBuilder } from 'typeorm';
+import { In, IsNull, SelectQueryBuilder } from 'typeorm';
 import { Raduserprofile } from "../db/entities/Raduserprofile";
 import { Invoices } from "../db/entities/Invoices";
 import { startOfMonth } from "date-fns";
@@ -48,6 +48,28 @@ function normalizeAgeBucket(value?: string): AgingBucket | null {
     if (raw === '61_90' || raw === '61-90') return '61_90';
     if (raw === '90_plus' || raw === '90+') return '90_plus';
     return null;
+}
+
+export type MissingDataFilter = 'no_address' | 'no_pay_due';
+
+function normalizeMissingDataFilter(value?: string): MissingDataFilter | null {
+    const raw = String(value || '').trim().toLowerCase();
+    if (raw === 'no_address') return 'no_address';
+    if (raw === 'no_pay_due') return 'no_pay_due';
+    return null;
+}
+
+function applyMissingDataFilter(
+    qb: SelectQueryBuilder<ExternalInvoice>,
+    alias: string,
+    missingData?: string
+) {
+    const filter = normalizeMissingDataFilter(missingData);
+    if (filter === 'no_address') {
+        qb.andWhere(`(${alias}.address IS NULL OR TRIM(${alias}.address) = '')`);
+    } else if (filter === 'no_pay_due') {
+        qb.andWhere(`${alias}.payDueDate IS NULL`);
+    }
 }
 
 function applyAgeBucketFilter(
@@ -366,108 +388,460 @@ export const bulkPayInvoices = async (invoiceIds: number[]) => {
     return invoices;
 };
 
-// 1. Merge A and B
-function mergeExternalInvoices(
-    source: ExternalInvoice[],
-    incoming: Partial<ExternalInvoice>[]
-): Partial<ExternalInvoice>[] {
-    const sourceMap = new Map(source.map(item => [item.id, item]));
-    // Format date as YYYY-MM-DD
-    const today = new Date();
-    const billingMonth = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`;
+export type UpsertExternalInvoicesResult = {
+    inserted: number;
+    updated: number;
+    removedFromScope: number;
+    enrichedFromUserDetails: number;
+    inheritedPayDueDates?: number;
+};
 
-    return incoming.map(item => {
-        const sourceItem = sourceMap.get(item.id);
-
-        if (sourceItem) {
-            // Merge: override identity fields from source; prefer non-empty address from the import row
-            const incomingAddr = item.address;
-            const trimmedIncoming =
-                incomingAddr !== undefined && incomingAddr !== null
-                    ? String(incomingAddr).trim()
-                    : "";
-            const mergedAddress =
-                trimmedIncoming.length > 0 ? trimmedIncoming : sourceItem.address ?? null;
-
-            const incomingDue = item.payDueDate;
-            let mergedPayDue: string | null = sourceItem.payDueDate ?? null;
-            if (incomingDue !== undefined && incomingDue !== null && String(incomingDue).trim() !== '') {
-                const rawDue = incomingDue as string | Date;
-                const asDate = rawDue instanceof Date ? rawDue : new Date(String(rawDue));
-                if (!isNaN(asDate.getTime())) {
-                    mergedPayDue = asDate.toISOString().slice(0, 10);
-                } else {
-                    mergedPayDue = String(incomingDue).trim().slice(0, 10);
-                }
-            }
-
-            return {
-                ...item,
-                username: sourceItem.username,
-                fullName: sourceItem.fullName,
-                email: sourceItem.email || "",
-                // Do NOT inject placeholder phone numbers; keep empty so reminders can fail loudly.
-                phoneNumber: sourceItem.phoneNumber || "",
-                address: mergedAddress,
-                payDueDate: mergedPayDue,
-                billingMonth,
-                provider: sourceItem.provider,
-            };
-        }
-
-        // New record — keep as-is
-        return { ...item, email: item.email || "", phoneNumber: (item as any).phoneNumber || "", billingMonth };
-    });
+export function normalizeDebitLabel(value: unknown): string {
+    if (value === undefined || value === null) return '';
+    return String(value).trim().toLowerCase().slice(0, 64);
 }
 
-
-// 2. Update ExternalInvoice Table
-export const replaceExternalInvoices = async (incoming: Partial<ExternalInvoice>[]) => {
-    const repo = AppDataSource.getRepository(ExternalInvoice);
-    const queryRunner = AppDataSource.createQueryRunner();
-
-    try {
-        // Start transaction
-        await queryRunner.connect();
-        await queryRunner.startTransaction();
-
-        console.log(`incoming: ${incoming}`); // log the incoming data
-
-        // Fetch current records from the database
-        const current = await repo.find();
-
-        // Merge with incoming
-        const merged = mergeExternalInvoices(current, incoming);
-
-        console.log(`merged  ${merged}`); // log the result
-
-        try {
-            // Delete all records using DELETE instead of TRUNCATE
-            await queryRunner.manager
-                .createQueryBuilder()
-                .delete()
-                .from(ExternalInvoice)
-                .execute();
-
-            // Insert new merged records
-            await queryRunner.manager.save(ExternalInvoice, merged);
-
-            // Commit transaction
-            await queryRunner.commitTransaction();
-        } catch (err) {
-            // Rollback transaction on error
-            await queryRunner.rollbackTransaction();
-            throw err;
-        }
-
-        return merged;
-    } catch (error) {
-        console.error('Error in replaceExternalInvoices:', error);
-        throw error;
-    } finally {
-        // Release query runner
-        await queryRunner.release();
+export function normalizeBillingMonthKey(value: string | undefined | null): string {
+    if (!value) {
+        const today = new Date();
+        return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`;
     }
+    const s = String(value).trim();
+    const ym = /^(\d{4})-(\d{2})/.exec(s);
+    if (ym) return `${ym[1]}-${ym[2]}-01`;
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) {
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`;
+    }
+    const today = new Date();
+    return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`;
+}
+
+function externalInvoiceCompositeKey(item: Partial<ExternalInvoice>): string {
+    const username = String(item.username ?? '').trim().toLowerCase();
+    const billingMonth = normalizeBillingMonthKey(item.billingMonth as string);
+    const provider = String(item.provider ?? '').trim().toLowerCase();
+    const debitLabel = normalizeDebitLabel((item as ExternalInvoice).debitLabel);
+    return `${username}|${billingMonth}|${provider}|${debitLabel}`;
+}
+
+function accountKey(username: string, provider: string): string {
+    return `${String(username).trim().toLowerCase()}|${String(provider ?? '').trim().toLowerCase()}`;
+}
+
+/** Carry forward the customer's due day-of-month from their latest unpaid line (prior billing months). */
+export function inheritPayDueDatesFromPriorUnpaid(
+    incoming: Partial<ExternalInvoice>[],
+    existing: ExternalInvoice[]
+): number {
+    const priorByAccount = new Map<string, ExternalInvoice[]>();
+    for (const row of existing) {
+        if (row.status === 'paid') continue;
+        const acct = accountKey(row.username, row.provider);
+        if (!priorByAccount.has(acct)) priorByAccount.set(acct, []);
+        priorByAccount.get(acct)!.push(row);
+    }
+    for (const list of priorByAccount.values()) {
+        list.sort(
+            (a, b) =>
+                new Date(String(b.billingMonth)).getTime() - new Date(String(a.billingMonth)).getTime()
+        );
+    }
+
+    let inherited = 0;
+    for (const inv of incoming) {
+        if (inv.payDueDate !== undefined && inv.payDueDate !== null && String(inv.payDueDate).trim() !== '') {
+            continue;
+        }
+        const acct = accountKey(String(inv.username ?? ''), String(inv.provider ?? ''));
+        const list = priorByAccount.get(acct);
+        if (!list?.length) continue;
+
+        const debitNorm = normalizeDebitLabel((inv as ExternalInvoice).debitLabel);
+        const prior =
+            list.find(
+                (r) => normalizeDebitLabel(r.debitLabel) === debitNorm && r.payDueDate
+            ) ?? list.find((r) => r.payDueDate);
+        if (!prior?.payDueDate) continue;
+
+        const priorDay = parseInt(String(prior.payDueDate).slice(8, 10), 10);
+        if (!Number.isFinite(priorDay) || priorDay < 1 || priorDay > 31) continue;
+
+        const bm = normalizeBillingMonthKey(inv.billingMonth as string);
+        const match = /^(\d{4})-(\d{2})/.exec(bm);
+        if (!match) continue;
+        const year = parseInt(match[1], 10);
+        const month = parseInt(match[2], 10);
+        const lastDay = new Date(year, month, 0).getDate();
+        const day = Math.min(priorDay, lastDay);
+        inv.payDueDate = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        inherited++;
+    }
+    return inherited;
+}
+
+function mergeOptionalAddress(
+    existing: string | null | undefined,
+    incoming: unknown
+): string | null {
+    const trimmedIncoming =
+        incoming !== undefined && incoming !== null ? String(incoming).trim() : '';
+    if (trimmedIncoming.length > 0) return trimmedIncoming;
+    const existingTrim = existing !== undefined && existing !== null ? String(existing).trim() : '';
+    return existingTrim.length > 0 ? existingTrim : null;
+}
+
+function mergeOptionalPayDueDate(
+    existing: string | null | undefined,
+    incoming: unknown
+): string | null {
+    if (incoming !== undefined && incoming !== null && String(incoming).trim() !== '') {
+        const rawDue = incoming as string | Date;
+        const asDate = rawDue instanceof Date ? rawDue : new Date(String(rawDue));
+        if (!isNaN(asDate.getTime())) return asDate.toISOString().slice(0, 10);
+        return String(incoming).trim().slice(0, 10);
+    }
+    if (existing !== undefined && existing !== null && String(existing).trim() !== '') {
+        return String(existing).slice(0, 10);
+    }
+    return null;
+}
+
+function mergeIncomingExternalInvoice(
+    existing: ExternalInvoice,
+    incoming: Partial<ExternalInvoice>
+): ExternalInvoice {
+    const merged = Object.assign({}, existing, incoming, {
+        id: existing.id,
+        username: existing.username,
+        fullName: String(incoming.fullName ?? existing.fullName ?? '').trim() || existing.fullName,
+        email: String(incoming.email ?? existing.email ?? '').trim() || existing.email || '',
+        phoneNumber: String(incoming.phoneNumber ?? existing.phoneNumber ?? '').trim() || existing.phoneNumber || '',
+        address: mergeOptionalAddress(existing.address, incoming.address),
+        payDueDate: mergeOptionalPayDueDate(existing.payDueDate, incoming.payDueDate),
+        billingMonth: normalizeBillingMonthKey((incoming.billingMonth as string) ?? existing.billingMonth),
+        provider: String(incoming.provider ?? existing.provider ?? '').trim() || existing.provider,
+        debitLabel: normalizeDebitLabel(incoming.debitLabel ?? existing.debitLabel) || '',
+        modifiedAt: new Date(),
+        lastAction: incoming.lastAction || 'IMPORT_UPSERT',
+    });
+
+    if (existing.status === 'paid' && incoming.status !== 'paid') {
+        merged.status = existing.status;
+        merged.paidAt = existing.paidAt;
+        merged.paymentMethod = existing.paymentMethod;
+        merged.collectedBy = existing.collectedBy;
+        merged.collectedAt = existing.collectedAt;
+    }
+
+    return merged;
+}
+
+export async function enrichExternalInvoicesFromUserDetails(
+    invoices: Partial<ExternalInvoice>[]
+): Promise<number> {
+    const usernames = [
+        ...new Set(invoices.map((i) => String(i.username || '').trim()).filter(Boolean)),
+    ];
+    if (usernames.length === 0) return 0;
+
+    const repo = AppDataSource.getRepository(UserDetails);
+    const rows = await repo.find({ where: { username: In(usernames) } });
+    const map = new Map(rows.map((r) => [r.username, r]));
+    let enriched = 0;
+
+    for (const inv of invoices) {
+        const ud = map.get(String(inv.username || '').trim());
+        if (!ud) continue;
+        let touched = false;
+
+        if (!String(inv.address ?? '').trim() && ud.address?.trim()) {
+            inv.address = ud.address.trim();
+            touched = true;
+        }
+        if (!String(inv.fullName ?? '').trim() && ud.fullName?.trim()) {
+            inv.fullName = ud.fullName.trim();
+            touched = true;
+        }
+        if (!String(inv.email ?? '').trim() && ud.email?.trim()) {
+            inv.email = ud.email.trim();
+            touched = true;
+        }
+        if (!String(inv.phoneNumber ?? '').trim() && ud.phoneNumber?.trim()) {
+            inv.phoneNumber = ud.phoneNumber.trim();
+            touched = true;
+        }
+        if (touched) enriched++;
+    }
+
+    return enriched;
+}
+
+export function applyDefaultPayDueDates(
+    invoices: Partial<ExternalInvoice>[],
+    dayOffset: number | null | undefined
+): void {
+    if (dayOffset === null || dayOffset === undefined || !Number.isFinite(dayOffset) || dayOffset < 0) {
+        return;
+    }
+    const offset = Math.round(dayOffset);
+    for (const inv of invoices) {
+        if (inv.payDueDate !== undefined && inv.payDueDate !== null && String(inv.payDueDate).trim() !== '') {
+            continue;
+        }
+        const bm = normalizeBillingMonthKey(inv.billingMonth as string);
+        const base = new Date(`${bm}T12:00:00`);
+        base.setDate(base.getDate() + offset);
+        inv.payDueDate = base.toISOString().slice(0, 10);
+    }
+}
+
+/** Upsert by username + billingMonth + provider; optionally soft-delete stale rows for imported billing months. */
+export const upsertExternalInvoices = async (
+    incoming: Partial<ExternalInvoice>[],
+    options?: { scopedBillingMonths?: string[]; actorUsername?: string }
+): Promise<UpsertExternalInvoicesResult> => {
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const current = await repo.find({ where: { deletedAt: IsNull() } });
+
+    const existingByKey = new Map<string, ExternalInvoice>();
+    for (const row of current) {
+        existingByKey.set(externalInvoiceCompositeKey(row), row);
+    }
+
+    const incomingKeys = new Set<string>();
+    let inserted = 0;
+    let updated = 0;
+    const toSave: ExternalInvoice[] = [];
+
+    for (const item of incoming) {
+        if (!String(item.username ?? '').trim()) continue;
+
+        const key = externalInvoiceCompositeKey(item);
+        incomingKeys.add(key);
+        const existing = existingByKey.get(key);
+
+        if (existing) {
+            toSave.push(mergeIncomingExternalInvoice(existing, item));
+            updated++;
+        } else {
+            toSave.push({
+                ...(item as ExternalInvoice),
+                billingMonth: normalizeBillingMonthKey(item.billingMonth as string),
+                email: item.email || '',
+                phoneNumber: item.phoneNumber || '',
+                debitLabel: normalizeDebitLabel((item as ExternalInvoice).debitLabel) || '',
+                lastAction: item.lastAction || 'IMPORT_INSERT',
+            });
+            inserted++;
+        }
+    }
+
+    if (toSave.length > 0) {
+        await repo.save(toSave);
+    }
+
+    let removedFromScope = 0;
+    const scopedMonths = (options?.scopedBillingMonths ?? []).map((m) => normalizeBillingMonthKey(m));
+    if (scopedMonths.length > 0) {
+        const actor = options?.actorUsername || 'system';
+        const stale = current.filter((row) => {
+            const bm = normalizeBillingMonthKey(row.billingMonth);
+            if (!scopedMonths.includes(bm)) return false;
+            return !incomingKeys.has(externalInvoiceCompositeKey(row));
+        });
+
+        if (stale.length > 0) {
+            for (const inv of stale) {
+                inv.deletedBy = actor;
+            }
+            await repo.softRemove(stale);
+            for (const inv of stale) {
+                invoiceEvents.emitModification({
+                    invoiceId: inv.id || -1,
+                    username: actor,
+                    action: 'DELETED',
+                    timestamp: new Date(),
+                });
+            }
+            removedFromScope = stale.length;
+        }
+    }
+
+    return { inserted, updated, removedFromScope, enrichedFromUserDetails: 0 };
+};
+
+/** @deprecated Use upsertExternalInvoices — kept for backward compatibility. */
+export const replaceExternalInvoices = async (incoming: Partial<ExternalInvoice>[]) => {
+    const scopedBillingMonths = [
+        ...new Set(incoming.map((i) => normalizeBillingMonthKey(i.billingMonth as string))),
+    ];
+    const result = await upsertExternalInvoices(incoming, { scopedBillingMonths });
+    return result;
+};
+
+export const bulkUpdateExternalInvoices = async (
+    invoiceIds: number[],
+    updateData: Partial<Pick<ExternalInvoice, 'payDueDate' | 'address'>>,
+    actorUsername: string
+) => {
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const uniqueIds = Array.from(new Set(invoiceIds))
+        .map((x) => Number(x))
+        .filter((x) => Number.isFinite(x) && x > 0);
+
+    if (uniqueIds.length === 0) {
+        return { updatedIds: [] as number[], failed: [] as Array<{ id: number; reason: string }> };
+    }
+
+    const invoices = await repo.find({ where: { id: In(uniqueIds) as any, deletedAt: IsNull() } });
+    const foundIds = new Set(invoices.map((i) => i.id).filter(Boolean) as number[]);
+    const failed: Array<{ id: number; reason: string }> = [];
+
+    for (const id of uniqueIds) {
+        if (!foundIds.has(id)) {
+            failed.push({ id, reason: 'Invoice not found' });
+        }
+    }
+
+    for (const inv of invoices) {
+        if (updateData.address !== undefined) {
+            const trimmed = updateData.address === null ? '' : String(updateData.address).trim();
+            inv.address = trimmed.length > 0 ? trimmed : null;
+        }
+        if (updateData.payDueDate !== undefined) {
+            inv.payDueDate =
+                updateData.payDueDate === null || String(updateData.payDueDate).trim() === ''
+                    ? null
+                    : String(updateData.payDueDate).slice(0, 10);
+        }
+        inv.modifiedBy = actorUsername;
+        inv.modifiedAt = new Date();
+        inv.lastAction = 'BULK_UPDATE';
+    }
+
+    if (invoices.length > 0) {
+        await repo.save(invoices);
+    }
+
+    return {
+        updatedIds: invoices.map((i) => i.id).filter(Boolean) as number[],
+        failed,
+    };
+};
+
+export const getExternalInvoicePaymentLines = async (
+    username: string,
+    billingMonth: string,
+    provider?: string
+) => {
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const bm = normalizeBillingMonthKey(billingMonth);
+    const qb = repo
+        .createQueryBuilder('e')
+        .where('e.deletedAt IS NULL')
+        .andWhere('e.username = :username', { username: String(username).trim() })
+        .andWhere('e.billingMonth = :billingMonth', { billingMonth: bm })
+        .orderBy('e.debitLabel', 'ASC')
+        .addOrderBy('e.id', 'ASC');
+
+    if (provider && String(provider).trim()) {
+        qb.andWhere('e.provider = :provider', { provider: String(provider).trim() });
+    }
+
+    return qb.getMany();
+};
+
+export const createExternalInvoiceDebit = async (input: {
+    sourceInvoiceId?: number;
+    username?: string;
+    billingMonth?: string;
+    provider?: string;
+    debitLabel: string;
+    amount: number;
+    payDueDate?: string | null;
+    status?: string;
+    actorUsername: string;
+}) => {
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const label = normalizeDebitLabel(input.debitLabel);
+    if (!label) {
+        throw new Error('debitLabel is required (e.g. carryover, second-payment)');
+    }
+    if (!Number.isFinite(input.amount) || input.amount <= 0) {
+        throw new Error('amount must be greater than 0');
+    }
+
+    let seed: Partial<ExternalInvoice> = {};
+    if (input.sourceInvoiceId) {
+        const source = await repo.findOne({ where: { id: input.sourceInvoiceId, deletedAt: IsNull() } });
+        if (!source) throw new Error('Source invoice not found');
+        seed = source;
+    }
+
+    const username = String(input.username ?? seed.username ?? '').trim();
+    const provider = String(input.provider ?? seed.provider ?? '').trim();
+    const billingMonth = normalizeBillingMonthKey(
+        (input.billingMonth as string) ?? (seed.billingMonth as string)
+    );
+    if (!username || !provider) {
+        throw new Error('username and provider are required');
+    }
+
+    const composite = externalInvoiceCompositeKey({
+        username,
+        billingMonth,
+        provider,
+        debitLabel: label,
+    } as ExternalInvoice);
+    const existing = await repo.find({ where: { deletedAt: IsNull() } });
+    const duplicate = existing.find((row) => externalInvoiceCompositeKey(row) === composite);
+    if (duplicate) {
+        throw new Error(`A payment line "${label}" already exists for this customer and billing month`);
+    }
+
+    let payDueDate: string | null =
+        input.payDueDate !== undefined && input.payDueDate !== null && String(input.payDueDate).trim() !== ''
+            ? String(input.payDueDate).slice(0, 10)
+            : null;
+
+    if (!payDueDate) {
+        const stub: Partial<ExternalInvoice> = {
+            username,
+            provider,
+            billingMonth,
+            debitLabel: label,
+        };
+        inheritPayDueDatesFromPriorUnpaid([stub], existing);
+        payDueDate = stub.payDueDate ?? seed.payDueDate ?? null;
+    }
+
+    const invoice = repo.create({
+        username,
+        fullName: seed.fullName ?? '',
+        email: seed.email ?? '',
+        phoneNumber: seed.phoneNumber ?? '',
+        address: seed.address ?? null,
+        provider,
+        billingMonth,
+        debitLabel: label,
+        amount: input.amount,
+        status: input.status || 'pending',
+        payDueDate,
+        modifiedBy: input.actorUsername,
+        modifiedAt: new Date(),
+        lastAction: 'DEBIT_ADDED',
+    });
+
+    const saved = await repo.save(invoice);
+    invoiceEvents.emitModification({
+        invoiceId: saved.id || -1,
+        username: input.actorUsername,
+        action: 'UPDATED',
+        timestamp: new Date(),
+        changes: { debitLabel: label, amount: input.amount, kind: 'DEBIT_ADDED' },
+    });
+    return saved;
 };
 
 export const getAllExternalInvoices = async (
@@ -481,7 +855,8 @@ export const getAllExternalInvoices = async (
     sortDir: 'ASC' | 'DESC' = 'DESC',
     includeDeleted = false,
     ageBucket?: string,
-    graceDays = 7
+    graceDays = 7,
+    missingData?: string
 ) => {
     const externalInvoiceRepo = AppDataSource.getRepository(ExternalInvoice);
 
@@ -523,6 +898,7 @@ export const getAllExternalInvoices = async (
         qb.andWhere("externalInvoice.status = :status", { status });
     }
     applyAgeBucketFilter(qb, 'externalInvoice', ageBucket, graceDays);
+    applyMissingDataFilter(qb, 'externalInvoice', missingData);
 
     // Fetch paginated results
     const [data, total] = await qb.getManyAndCount();
@@ -559,6 +935,7 @@ export const getAllExternalInvoices = async (
         baseQb.andWhere("externalInvoice.status = :status", { status });
     }
     applyAgeBucketFilter(baseQb, 'externalInvoice', ageBucket, graceDays);
+    applyMissingDataFilter(baseQb, 'externalInvoice', missingData);
 
     const totalPaid = await baseQb
         .clone()

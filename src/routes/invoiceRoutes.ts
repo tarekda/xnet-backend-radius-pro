@@ -1,6 +1,6 @@
 // src/routes/invoice.routes.ts
 import { Router } from "express";
-import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceHistoryHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler } from "../controllers/invoiceController";
+import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler } from "../controllers/invoiceController";
 import multer from "multer";
 import { authenticateToken, authorizeAnyPermissions, authorizePermissions, authorizeRoles } from '../middleware/authMiddleware';
 const upload = multer({ dest: "uploads/" }); // temp folder
@@ -135,6 +135,24 @@ router.post(
 router.put("/external/:invoiceId",authenticateToken, updateExternalInvoiceHandler);
 router.delete("/external/:invoiceId", authenticateToken,deleteExternalInvoiceHandler);
 router.post("/external/bulk-delete", authenticateToken, authorizeRoles('admin','manager'), bulkDeleteExternalInvoicesHandler);
+router.get(
+  "/external/payment-lines",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.viewTotals",
+    "billing.externalInvoices.pay",
+    "billing.externalInvoices.unpay"
+  ),
+  getExternalInvoicePaymentLinesHandler
+);
+router.post(
+  "/external/debit",
+  authenticateToken,
+  authorizeRoles('admin', 'manager'),
+  createExternalInvoiceDebitHandler
+);
+router.post("/external/bulk-update", authenticateToken, authorizeRoles('admin','manager'), bulkUpdateExternalInvoicesHandler);
 
 // Collected metrics & drilldowns
 router.get('/collected/metrics', authenticateToken, authorizeRoles('admin','manager','support','collector'), getCollectedMetricsHandler);

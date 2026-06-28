@@ -124,6 +124,23 @@ async function ensureQuotaCycleStartDateColumn(): Promise<void> {
     console.log("✅ Added raduserprofile.quota_cycle_start_date");
 }
 
+async function ensureExternalInvoiceDebitLabelColumn(): Promise<void> {
+    const rows = (await AppDataSource.query(
+        `SELECT COUNT(*) AS cnt
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'external_invoices'
+           AND COLUMN_NAME = 'debitLabel'`
+    )) as Array<{ cnt: string | number }>;
+    if (Number(rows?.[0]?.cnt ?? 0) > 0) return;
+    await AppDataSource.query(
+        `ALTER TABLE external_invoices
+           ADD COLUMN debitLabel VARCHAR(64) NOT NULL DEFAULT ''
+           AFTER provider`
+    );
+    console.log("✅ Added external_invoices.debitLabel");
+}
+
 export const initializeDB = async () => {
     try {
         // Debug: Log entities being loaded
@@ -145,6 +162,12 @@ export const initializeDB = async () => {
             await ensureExternalInvoiceLastRemindedAtColumn();
         } catch (patchError: any) {
             console.warn("⚠️ lastRemindedAt schema patch skipped:", patchError?.message || patchError);
+        }
+
+        try {
+            await ensureExternalInvoiceDebitLabelColumn();
+        } catch (patchError: any) {
+            console.warn("⚠️ debitLabel schema patch skipped:", patchError?.message || patchError);
         }
     } catch (error: any) {
         console.error("❌ Error connecting to database:", error);

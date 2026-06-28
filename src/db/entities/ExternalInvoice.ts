@@ -77,6 +77,10 @@ export class ExternalInvoice {
   @Column("varchar", { name: "provider", length: 10 })
   provider: string;
 
+  /** Optional line label for multiple charges per user/month (e.g. carryover, second debit). Empty = primary line. */
+  @Column("varchar", { name: "debitLabel", length: 64, default: () => "''" })
+  debitLabel: string;
+
   @Column("datetime", {
     name: "modifiedAt",
     nullable: true,
