@@ -7,9 +7,10 @@ import {
   upsertExternalInvoices,
   enrichExternalInvoicesFromUserDetails,
   applyDefaultPayDueDates,
-  inheritPayDueDatesFromPriorUnpaid,
+  inheritPayDueDatesFromPrior,
+  inheritCarryoverLinesFromPriorMonth,
+  mergeDuplicateIncomingInvoices,
   normalizeBillingMonthKey,
-  normalizeDebitLabel,
   createExternalInvoiceDebit,
   getExternalInvoicePaymentLines,
   updateExternalInvoice,
@@ -29,12 +30,20 @@ import {
   getExternalInvoicesPaymentDueTracker,
   getExternalInvoicesMonthlyTrend,
 } from "../services/invoiceService";
-import * as XLSX from "xlsx";
-import fs from "fs";
+import {
+  buildImportPreview,
+  cleanupImportFile,
+  normalizeToMonthStart,
+  parseColumnMappingInput,
+  parseImportFileToInvoices,
+  parseImportWorkbook,
+  suggestColumnMapping,
+} from "../services/externalInvoiceImportParser";
 import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import { invoiceEvents } from "../events/invoiceEvents";
 import eventBus from "../bus/eventBusSingleton";
 import { AppDataSource } from "../db/config";
+import { IsNull } from "typeorm";
 import { Invoices } from "../db/entities/Invoices";
 import { UserDetails } from "../db/entities/UserDetails";
 import { Raduserprofile } from "../db/entities/Raduserprofile";
@@ -617,174 +626,106 @@ export const getCollectedInvoicesListHandler = async (req: Request, res: Respons
   }
 };
 
-export const uploadExternalInvoiceFile = async (req: Request, res: Response) => {
+export const previewExternalInvoiceFile = async (req: Request, res: Response) => {
+  const filePath = req.file?.path || '';
   try {
-    const filePath = req.file?.path || '';
-    if (!filePath || filePath === undefined || filePath === '') res.status(400).json({ message: "File not found" });
+    if (!filePath) {
+      res.status(400).json({ success: false, message: 'File not found' });
+      return;
+    }
 
-    // Optional month override (e.g., '2025-01' or '2025-01-01')
     const requestedMonth = (req.body?.billingMonth as string) || (req.query?.billingMonth as string) || '';
-    const normalizeToMonthStart = (value: string): string | null => {
-      if (!value) return null;
-      // Accept YYYY-MM or YYYY-MM-01 or any parsable date
-      let year = 0, month = 0;
-      const ymMatch = /^(\d{4})-(\d{2})(?:-\d{2})?$/.exec(value);
-      if (ymMatch) {
-        year = parseInt(ymMatch[1], 10);
-        month = parseInt(ymMatch[2], 10);
-      } else {
-        const d = new Date(value);
-        if (isNaN(d.getTime())) return null;
-        year = d.getFullYear();
-        month = d.getMonth() + 1;
-      }
-      if (!year || !month || month < 1 || month > 12) return null;
-      return `${year}-${String(month).padStart(2,'0')}-01`;
-    };
     const monthOverride = normalizeToMonthStart(requestedMonth) || null;
+    const mapping = parseColumnMappingInput(req.body?.columnMapping);
 
-    // Parse Excel
-    const workbook = XLSX.readFile(filePath);
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const raw = XLSX.utils.sheet_to_json(sheet);
-
-    const normalizeCell = (v: unknown): string | null => {
-      if (v === undefined || v === null) return null;
-      const s = String(v).trim();
-      return s.length ? s : null;
-    };
-
-    const pickRowAddress = (row: Record<string, unknown>): string | null =>
-      normalizeCell(row.address) ??
-      normalizeCell(row.Address) ??
-      normalizeCell(row.ADDRESS) ??
-      normalizeCell((row as any)["Address Line 1"]) ??
-      null;
-
-    const parsePayDueFromRow = (row: Record<string, unknown>): string | null => {
-      const raw =
-        row.payDueDate ??
-        row.paydate ??
-        row.PayDate ??
-        row.pay_date ??
-        (row as { payDue?: unknown }).payDue ??
-        (row as { "Pay Due"?: unknown })["Pay Due"];
-      if (raw === undefined || raw === null || raw === "") return null;
-      if (typeof raw === "number" && raw > 20000 && raw < 100000) {
-        const ms = Math.round((raw - 25569) * 86400 * 1000);
-        const d = new Date(ms);
-        if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
-      }
-      if (raw instanceof Date && !isNaN(raw.getTime())) {
-        return raw.toISOString().slice(0, 10);
-      }
-      const d = new Date(String(raw));
-      if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
-      return null;
-    };
-
-    const pickRowDebitLabel = (row: Record<string, unknown>): string =>
-      normalizeDebitLabel(
-        row.debitLabel ??
-          row.debit ??
-          row.DebitLabel ??
-          (row as { "Debit Label"?: unknown })["Debit Label"] ??
-          ''
-      );
-
-    // Optional: validate/transform
-    const invoices = raw.map((row: any) => {
-      console.log(`row: ${JSON.stringify(row)}`);
-      
-      // Format billing month as YYYY-MM-DD
-      let billingDate;
-      if (monthOverride) {
-        billingDate = monthOverride;
-      } else if (row.billingMonth) {
-        const date = new Date(row.billingMonth);
-        if (isNaN(date.getTime())) {
-          // If invalid date, use current month
-          const today = new Date();
-          billingDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`;
-        } else {
-          billingDate = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-01`;
-        }
-      } else {
-        // If no date provided, use current month
-        const today = new Date();
-        billingDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`;
-      }
-      
-      let inv: Partial<ExternalInvoice> = {
-        username: row.username,
-        fullName: row.fullName,
-        email: row.email,
-        provider: row.provider,
-        phoneNumber: row.phoneNumber,
-        address: pickRowAddress(row),
-        payDueDate: parsePayDueFromRow(row),
-        debitLabel: pickRowDebitLabel(row),
-        billingMonth: billingDate,
-        amount: parseFloat(row.amount || 30),
-        status: row.status || "pending",
-        paidAt: row.paidAt ? new Date(row.paidAt) : null,
-        modifiedBy: req.user?.username,
-        modifiedAt: new Date()||null,
-        lastAction: "UPLOAD"
-      }
-      return inv;
+    const parsed = parseImportWorkbook(filePath);
+    const preview = buildImportPreview(parsed, {
+      mapping: mapping ?? suggestColumnMapping(parsed.headers),
+      monthOverride,
+      previewLimit: 10,
     });
 
-    console.log(`invoices: ${invoices}`); // for validatio
-    // Filter out users whose username ends with 'xn' (case-insensitive)
-    const filteredInvoices = invoices.filter((inv) => {
-      const uname = (inv.fullName ?? '').toString().trim().toLowerCase();
-      return !uname.endsWith('xn');
+    cleanupImportFile(filePath);
+    res.status(200).json({ success: true, data: preview });
+  } catch (err) {
+    console.error('Import preview error:', err);
+    cleanupImportFile(filePath);
+    res.status(500).json({ success: false, message: 'Failed to preview invoice file' });
+  }
+};
+
+export const uploadExternalInvoiceFile = async (req: Request, res: Response) => {
+  const filePath = req.file?.path || '';
+  try {
+    if (!filePath) {
+      res.status(400).json({ success: false, message: 'File not found' });
+      return;
+    }
+
+    const requestedMonth = (req.body?.billingMonth as string) || (req.query?.billingMonth as string) || '';
+    const monthOverride = normalizeToMonthStart(requestedMonth) || null;
+    const columnMapping = parseColumnMappingInput(req.body?.columnMapping);
+
+    const { invoices: parsedInvoices, skippedCount } = parseImportFileToInvoices(filePath, {
+      mapping: columnMapping,
+      monthOverride,
+      actorUsername: req.user?.username,
     });
-    console.log(`Filtered out ${invoices.length - filteredInvoices.length} invoice(s) ending with 'xn'`);
+
+    if (skippedCount > 0) {
+      console.log(`Import skipped ${skippedCount} row(s) (missing username or filtered)`);
+    }
+
+    // Merge rows describing the same invoice (same username + full name + month + provider + line)
+    const { invoices: filteredInvoices, merged: mergedDuplicates } = mergeDuplicateIncomingInvoices(parsedInvoices);
+    if (mergedDuplicates > 0) {
+      console.log(`Import merged ${mergedDuplicates} duplicate row(s) into existing records`);
+    }
 
     const enrichedFromUserDetails = await enrichExternalInvoicesFromUserDetails(filteredInvoices);
 
-    const inheritPayDue =
-      req.body?.inheritPayDue !== 'false' &&
-      req.body?.inheritPayDue !== false &&
-      String(req.body?.inheritPayDue ?? 'true').toLowerCase() !== 'false';
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const currentRows = await repo.find({ where: { deletedAt: IsNull() } });
 
-    let inheritedPayDueDates = 0;
-    if (inheritPayDue) {
-      const repo = AppDataSource.getRepository(ExternalInvoice);
-      const currentRows = await repo.find();
-      inheritedPayDueDates = inheritPayDueDatesFromPriorUnpaid(filteredInvoices, currentRows);
-    }
+    const { invoices: withCarryover, added: inheritedCarryoverLines } = inheritCarryoverLinesFromPriorMonth(
+      filteredInvoices,
+      currentRows
+    );
+
+    const inheritedPayDueDates = inheritPayDueDatesFromPrior(withCarryover, currentRows, {
+      overrideIncoming: true,
+    });
 
     const payDueDayOffsetRaw = req.body?.payDueDayOffset;
     if (payDueDayOffsetRaw !== undefined && payDueDayOffsetRaw !== null && String(payDueDayOffsetRaw).trim() !== '') {
       const payDueDayOffset = parseInt(String(payDueDayOffsetRaw), 10);
       if (Number.isFinite(payDueDayOffset) && payDueDayOffset >= 0) {
-        applyDefaultPayDueDates(filteredInvoices, payDueDayOffset);
+        applyDefaultPayDueDates(withCarryover, payDueDayOffset);
       }
     }
 
     const scopedBillingMonths = monthOverride
       ? [monthOverride]
-      : [...new Set(filteredInvoices.map((i) => normalizeBillingMonthKey(i.billingMonth as string)))];
+      : [...new Set(withCarryover.map((i) => normalizeBillingMonthKey(i.billingMonth as string)))];
 
-    const upsertResult = await upsertExternalInvoices(filteredInvoices, {
+    const upsertResult = await upsertExternalInvoices(withCarryover, {
       scopedBillingMonths,
       actorUsername: req.user?.username,
     });
     upsertResult.enrichedFromUserDetails = enrichedFromUserDetails;
     upsertResult.inheritedPayDueDates = inheritedPayDueDates;
-
-    fs.unlinkSync(filePath); // cleanup
+    upsertResult.inheritedCarryoverLines = inheritedCarryoverLines;
+    upsertResult.mergedDuplicates = mergedDuplicates;
+    cleanupImportFile(filePath);
     res.status(200).json({
       success: true,
-      message: "Invoices uploaded successfully",
-      data: upsertResult,
+      message: 'Invoices uploaded successfully',
+      data: { ...upsertResult, skippedRows: skippedCount },
     });
   } catch (err) {
-    console.error("Upload error:", err);
-    res.status(500).json({ success: false, message: "Failed to upload invoice file" });
+    console.error('Upload error:', err);
+    cleanupImportFile(filePath);
+    res.status(500).json({ success: false, message: 'Failed to upload invoice file' });
   }
 };
 
@@ -899,8 +840,9 @@ export const getExternalInvoicesHandler = async (req: Request, res: Response) =>
     const sortBy = (req.query.sortBy as 'createdAt' | 'billingMonth' | 'amount') || 'createdAt';
     const sortDir = ((req.query.sortDir as string)?.toUpperCase() === 'ASC' ? 'ASC' : 'DESC') as 'ASC' | 'DESC';
     const missingData = (req.query.missing as string) || undefined;
+    const payDueFilter = (req.query.payDue as string) || undefined;
 
-    const result = await getAllExternalInvoices(page, limit, search, from, to, status, sortBy, sortDir, false, ageBucket, graceDays, missingData);
+    const result = await getAllExternalInvoices(page, limit, search, from, to, status, sortBy, sortDir, false, ageBucket, graceDays, missingData, payDueFilter);
     sendResponse(res, true, 200, "External invoices fetched successfully", result);
   } catch (err) {
     console.error("Error fetching external invoices:", err);

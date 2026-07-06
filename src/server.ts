@@ -37,6 +37,7 @@ import resellerRoutes from './routes/resellerRoutes';
 import auditRoutes from './routes/auditRoutes';
 import backupRoutes from './routes/backupRoutes';
 import cableVisionRoutes from './routes/cableVisionRoutes';
+import aiRoutes from './routes/aiRoutes';
 import './events/invoiceListeners'
 import cors from 'cors';
 import eventBus from './bus/eventBusSingleton';
@@ -205,6 +206,7 @@ app.use("/api", resellerRoutes);
 app.use("/api", backupRoutes);
 
 app.use("/api/cable-vision", cableVisionRoutes);
+app.use('/api', aiRoutes);
 
 const monthlyInvoiceTask = cron.schedule("0 0 1 * *", async () => {
     console.log("Running monthly invoice generation...");

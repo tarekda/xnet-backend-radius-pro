@@ -1,6 +1,6 @@
 // src/routes/invoice.routes.ts
 import { Router } from "express";
-import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler } from "../controllers/invoiceController";
+import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler } from "../controllers/invoiceController";
 import multer from "multer";
 import { authenticateToken, authorizeAnyPermissions, authorizePermissions, authorizeRoles } from '../middleware/authMiddleware';
 const upload = multer({ dest: "uploads/" }); // temp folder
@@ -16,6 +16,7 @@ router.post("/reconcile/bulk", authenticateToken, authorizeRoles('collector','ma
 router.post("/reconcile/:invoiceId", authenticateToken, authorizeRoles('collector','manager','admin'), reconcileInvoiceCashHandler);
 // Add route for bulk paying invoices
 router.post("/bulk-pay", authenticateToken, authorizeRoles('admin','manager'), bulkPayInvoicesHandler);
+router.post("/upload/preview", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), upload.single("file"), previewExternalInvoiceFile);
 router.post("/upload", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), upload.single("file"), uploadExternalInvoiceFile);
 router.get(
   "/whatsapp/diagnostics",

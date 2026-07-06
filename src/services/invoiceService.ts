@@ -72,6 +72,49 @@ function applyMissingDataFilter(
     }
 }
 
+export type PayDueFilter = 'today' | 'overdue' | 'this_week' | 'this_month' | 'upcoming';
+
+function normalizePayDueFilter(value?: string): PayDueFilter | null {
+    const raw = String(value || '').trim().toLowerCase();
+    if (raw === 'today') return 'today';
+    if (raw === 'overdue') return 'overdue';
+    if (raw === 'this_week' || raw === 'this-week' || raw === 'next_7_days') return 'this_week';
+    if (raw === 'this_month' || raw === 'this-month' || raw === 'month') return 'this_month';
+    if (raw === 'upcoming') return 'upcoming';
+    return null;
+}
+
+function applyPayDueFilter(
+    qb: SelectQueryBuilder<ExternalInvoice>,
+    alias: string,
+    payDueFilter?: string
+) {
+    const filter = normalizePayDueFilter(payDueFilter);
+    if (!filter) return;
+
+    qb.andWhere(`${alias}.payDueDate IS NOT NULL`);
+
+    if (filter === 'today') {
+        qb.andWhere(`${alias}.payDueDate = CURDATE()`);
+        return;
+    }
+    if (filter === 'overdue') {
+        qb.andWhere(`${alias}.payDueDate < CURDATE()`);
+        return;
+    }
+    if (filter === 'this_week') {
+        qb.andWhere(`${alias}.payDueDate >= CURDATE()`);
+        qb.andWhere(`${alias}.payDueDate <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)`);
+        return;
+    }
+    if (filter === 'this_month') {
+        qb.andWhere(`${alias}.payDueDate >= DATE_FORMAT(CURDATE(), '%Y-%m-01')`);
+        qb.andWhere(`${alias}.payDueDate <= LAST_DAY(CURDATE())`);
+        return;
+    }
+    qb.andWhere(`${alias}.payDueDate > DATE_ADD(CURDATE(), INTERVAL 7 DAY)`);
+}
+
 function applyAgeBucketFilter(
     qb: SelectQueryBuilder<ExternalInvoice>,
     alias: string,
@@ -394,6 +437,8 @@ export type UpsertExternalInvoicesResult = {
     removedFromScope: number;
     enrichedFromUserDetails: number;
     inheritedPayDueDates?: number;
+    inheritedCarryoverLines?: number;
+    mergedDuplicates?: number;
 };
 
 export function normalizeDebitLabel(value: unknown): string {
@@ -429,55 +474,210 @@ function accountKey(username: string, provider: string): string {
     return `${String(username).trim().toLowerCase()}|${String(provider ?? '').trim().toLowerCase()}`;
 }
 
-/** Carry forward the customer's due day-of-month from their latest unpaid line (prior billing months). */
-export function inheritPayDueDatesFromPriorUnpaid(
-    incoming: Partial<ExternalInvoice>[],
-    existing: ExternalInvoice[]
-): number {
-    const priorByAccount = new Map<string, ExternalInvoice[]>();
-    for (const row of existing) {
-        if (row.status === 'paid') continue;
-        const acct = accountKey(row.username, row.provider);
-        if (!priorByAccount.has(acct)) priorByAccount.set(acct, []);
-        priorByAccount.get(acct)!.push(row);
+export function previousBillingMonthKey(billingMonth: string): string {
+    const bm = normalizeBillingMonthKey(billingMonth);
+    const match = /^(\d{4})-(\d{2})/.exec(bm);
+    if (!match) return bm;
+    let year = parseInt(match[1], 10);
+    let month = parseInt(match[2], 10) - 1;
+    if (month < 1) {
+        month = 12;
+        year -= 1;
     }
-    for (const list of priorByAccount.values()) {
-        list.sort(
-            (a, b) =>
-                new Date(String(b.billingMonth)).getTime() - new Date(String(a.billingMonth)).getTime()
-        );
-    }
+    return `${year}-${String(month).padStart(2, '0')}-01`;
+}
 
+export function isCarryoverDebitLabel(value: unknown): boolean {
+    return normalizeDebitLabel(value) === 'carryover';
+}
+
+function payDueDayInMonth(payDueDate: string | null | undefined): number | null {
+    if (!payDueDate || String(payDueDate).trim() === '') return null;
+    const day = parseInt(String(payDueDate).slice(8, 10), 10);
+    return Number.isFinite(day) && day >= 1 && day <= 31 ? day : null;
+}
+
+function payDueDateForBillingMonth(billingMonth: string, dayOfMonth: number): string | null {
+    const bm = normalizeBillingMonthKey(billingMonth);
+    const match = /^(\d{4})-(\d{2})/.exec(bm);
+    if (!match) return null;
+    const year = parseInt(match[1], 10);
+    const month = parseInt(match[2], 10);
+    const lastDay = new Date(year, month, 0).getDate();
+    const day = Math.min(dayOfMonth, lastDay);
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function priorRowsForAccount(
+    existing: ExternalInvoice[],
+    username: string,
+    provider: string,
+    beforeBillingMonth: string
+): ExternalInvoice[] {
+    const acct = accountKey(username, provider);
+    const cutoff = new Date(`${normalizeBillingMonthKey(beforeBillingMonth)}T12:00:00`).getTime();
+    return existing
+        .filter((row) => {
+            if (row.deletedAt) return false;
+            if (accountKey(row.username, row.provider) !== acct) return false;
+            const rowTime = new Date(String(row.billingMonth)).getTime();
+            return rowTime < cutoff;
+        })
+        .sort((a, b) => new Date(String(b.billingMonth)).getTime() - new Date(String(a.billingMonth)).getTime());
+}
+
+/** Carry forward due day-of-month from the customer's latest prior invoice line into the import billing month. */
+export function inheritPayDueDatesFromPrior(
+    incoming: Partial<ExternalInvoice>[],
+    existing: ExternalInvoice[],
+    options?: { overrideIncoming?: boolean }
+): number {
+    const overrideIncoming = options?.overrideIncoming ?? false;
     let inherited = 0;
+
     for (const inv of incoming) {
-        if (inv.payDueDate !== undefined && inv.payDueDate !== null && String(inv.payDueDate).trim() !== '') {
-            continue;
-        }
-        const acct = accountKey(String(inv.username ?? ''), String(inv.provider ?? ''));
-        const list = priorByAccount.get(acct);
-        if (!list?.length) continue;
+        const hasIncoming =
+            inv.payDueDate !== undefined && inv.payDueDate !== null && String(inv.payDueDate).trim() !== '';
+        if (hasIncoming && !overrideIncoming) continue;
+
+        const list = priorRowsForAccount(
+            existing,
+            String(inv.username ?? ''),
+            String(inv.provider ?? ''),
+            inv.billingMonth as string
+        );
+        if (!list.length) continue;
 
         const debitNorm = normalizeDebitLabel((inv as ExternalInvoice).debitLabel);
         const prior =
-            list.find(
-                (r) => normalizeDebitLabel(r.debitLabel) === debitNorm && r.payDueDate
-            ) ?? list.find((r) => r.payDueDate);
-        if (!prior?.payDueDate) continue;
+            list.find((r) => normalizeDebitLabel(r.debitLabel) === debitNorm && payDueDayInMonth(r.payDueDate)) ??
+            list.find((r) => payDueDayInMonth(r.payDueDate));
+        const priorDay = payDueDayInMonth(prior?.payDueDate);
+        if (!priorDay) continue;
 
-        const priorDay = parseInt(String(prior.payDueDate).slice(8, 10), 10);
-        if (!Number.isFinite(priorDay) || priorDay < 1 || priorDay > 31) continue;
+        const nextDue = payDueDateForBillingMonth(String(inv.billingMonth ?? ''), priorDay);
+        if (!nextDue) continue;
 
-        const bm = normalizeBillingMonthKey(inv.billingMonth as string);
-        const match = /^(\d{4})-(\d{2})/.exec(bm);
-        if (!match) continue;
-        const year = parseInt(match[1], 10);
-        const month = parseInt(match[2], 10);
-        const lastDay = new Date(year, month, 0).getDate();
-        const day = Math.min(priorDay, lastDay);
-        inv.payDueDate = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        inv.payDueDate = nextDue;
         inherited++;
     }
     return inherited;
+}
+
+/** @deprecated Use inheritPayDueDatesFromPrior */
+export const inheritPayDueDatesFromPriorUnpaid = inheritPayDueDatesFromPrior;
+
+function latestDateString(a: string | null | undefined, b: string | null | undefined): string | null {
+    const av = a && String(a).trim() ? String(a).slice(0, 10) : null;
+    const bv = b && String(b).trim() ? String(b).slice(0, 10) : null;
+    if (!av) return bv;
+    if (!bv) return av;
+    return av >= bv ? av : bv;
+}
+
+/**
+ * Merge import rows that describe the same invoice — same username, same full name,
+ * same billing month, provider, and payment line — into a single record.
+ * Amounts are summed; the pay due date keeps the most recent of the merged rows.
+ */
+export function mergeDuplicateIncomingInvoices(
+    incoming: Partial<ExternalInvoice>[]
+): { invoices: Partial<ExternalInvoice>[]; merged: number } {
+    const byKey = new Map<string, Partial<ExternalInvoice>>();
+    const order: string[] = [];
+    let merged = 0;
+
+    for (const inv of incoming) {
+        const fullNameKey = String(inv.fullName ?? '').trim().toLowerCase();
+        const key = `${externalInvoiceCompositeKey(inv)}|${fullNameKey}`;
+        const existing = byKey.get(key);
+
+        if (!existing) {
+            byKey.set(key, { ...inv });
+            order.push(key);
+            continue;
+        }
+
+        merged++;
+        existing.amount = Number(existing.amount ?? 0) + Number(inv.amount ?? 0);
+        existing.payDueDate = latestDateString(existing.payDueDate, inv.payDueDate);
+        if (!String(existing.email ?? '').trim() && String(inv.email ?? '').trim()) existing.email = inv.email;
+        if (!String(existing.phoneNumber ?? '').trim() && String(inv.phoneNumber ?? '').trim()) {
+            existing.phoneNumber = inv.phoneNumber;
+        }
+        if (!String(existing.address ?? '').trim() && String(inv.address ?? '').trim()) existing.address = inv.address;
+        // A merged record is only "paid" when every source row was paid.
+        if (existing.status === 'paid' && inv.status !== 'paid') existing.status = inv.status;
+    }
+
+    return { invoices: order.map((k) => byKey.get(k) as Partial<ExternalInvoice>), merged };
+}
+
+/** Add carryover payment lines when the prior month had an unpaid carryover debit for the same customer. */
+export function inheritCarryoverLinesFromPriorMonth(
+    incoming: Partial<ExternalInvoice>[],
+    existing: ExternalInvoice[]
+): { invoices: Partial<ExternalInvoice>[]; added: number } {
+    const incomingKeys = new Set(incoming.map((row) => externalInvoiceCompositeKey(row)));
+    const seedByAccount = new Map<string, Partial<ExternalInvoice>>();
+
+    for (const inv of incoming) {
+        const acct = accountKey(String(inv.username ?? ''), String(inv.provider ?? ''));
+        const current = seedByAccount.get(acct);
+        if (!current || !normalizeDebitLabel((inv as ExternalInvoice).debitLabel)) {
+            seedByAccount.set(acct, inv);
+        }
+    }
+
+    const added: Partial<ExternalInvoice>[] = [];
+
+    for (const seed of seedByAccount.values()) {
+        const username = String(seed.username ?? '').trim();
+        const provider = String(seed.provider ?? '').trim();
+        if (!username || !provider) continue;
+
+        const billingMonth = normalizeBillingMonthKey(seed.billingMonth as string);
+        const carryoverKey = externalInvoiceCompositeKey({
+            username,
+            provider,
+            billingMonth,
+            debitLabel: 'carryover',
+        } as ExternalInvoice);
+        if (incomingKeys.has(carryoverKey)) continue;
+
+        const priorMonth = previousBillingMonthKey(billingMonth);
+        const priorCarryover = existing.find(
+            (row) =>
+                !row.deletedAt &&
+                accountKey(row.username, row.provider) === accountKey(username, provider) &&
+                normalizeBillingMonthKey(row.billingMonth) === priorMonth &&
+                isCarryoverDebitLabel(row.debitLabel) &&
+                row.status !== 'paid' &&
+                Number(row.amount) > 0
+        );
+        if (!priorCarryover) continue;
+
+        added.push({
+            username,
+            fullName: String(seed.fullName ?? priorCarryover.fullName ?? '').trim() || priorCarryover.fullName,
+            email: String(seed.email ?? priorCarryover.email ?? '').trim() || priorCarryover.email || '',
+            phoneNumber:
+                String(seed.phoneNumber ?? priorCarryover.phoneNumber ?? '').trim() ||
+                priorCarryover.phoneNumber ||
+                '',
+            address: seed.address ?? priorCarryover.address ?? null,
+            provider,
+            billingMonth,
+            debitLabel: 'carryover',
+            amount: priorCarryover.amount,
+            status: 'pending',
+            lastAction: 'IMPORT_CARRYOVER',
+            modifiedBy: seed.modifiedBy,
+        });
+        incomingKeys.add(carryoverKey);
+    }
+
+    return { invoices: added.length > 0 ? [...incoming, ...added] : incoming, added: added.length };
 }
 
 function mergeOptionalAddress(
@@ -613,28 +813,42 @@ export const upsertExternalInvoices = async (
     let inserted = 0;
     let updated = 0;
     const toSave: ExternalInvoice[] = [];
+    const queuedByKey = new Map<string, ExternalInvoice>();
 
     for (const item of incoming) {
         if (!String(item.username ?? '').trim()) continue;
 
         const key = externalInvoiceCompositeKey(item);
+
+        // Same composite key appearing twice in one batch would violate uniqueness —
+        // fold the later row into the queued record instead of inserting a duplicate.
+        const queued = queuedByKey.get(key);
+        if (queued) {
+            queued.amount = Number(queued.amount ?? 0) + Number(item.amount ?? 0);
+            queued.payDueDate = latestDateString(queued.payDueDate, item.payDueDate as string | null);
+            continue;
+        }
+
         incomingKeys.add(key);
         const existing = existingByKey.get(key);
 
+        let record: ExternalInvoice;
         if (existing) {
-            toSave.push(mergeIncomingExternalInvoice(existing, item));
+            record = mergeIncomingExternalInvoice(existing, item);
             updated++;
         } else {
-            toSave.push({
+            record = {
                 ...(item as ExternalInvoice),
                 billingMonth: normalizeBillingMonthKey(item.billingMonth as string),
                 email: item.email || '',
                 phoneNumber: item.phoneNumber || '',
                 debitLabel: normalizeDebitLabel((item as ExternalInvoice).debitLabel) || '',
                 lastAction: item.lastAction || 'IMPORT_INSERT',
-            });
+            };
             inserted++;
         }
+        toSave.push(record);
+        queuedByKey.set(key, record);
     }
 
     if (toSave.length > 0) {
@@ -812,7 +1026,7 @@ export const createExternalInvoiceDebit = async (input: {
             billingMonth,
             debitLabel: label,
         };
-        inheritPayDueDatesFromPriorUnpaid([stub], existing);
+        inheritPayDueDatesFromPrior([stub], existing);
         payDueDate = stub.payDueDate ?? seed.payDueDate ?? null;
     }
 
@@ -856,7 +1070,8 @@ export const getAllExternalInvoices = async (
     includeDeleted = false,
     ageBucket?: string,
     graceDays = 7,
-    missingData?: string
+    missingData?: string,
+    payDueFilter?: string
 ) => {
     const externalInvoiceRepo = AppDataSource.getRepository(ExternalInvoice);
 
@@ -899,6 +1114,7 @@ export const getAllExternalInvoices = async (
     }
     applyAgeBucketFilter(qb, 'externalInvoice', ageBucket, graceDays);
     applyMissingDataFilter(qb, 'externalInvoice', missingData);
+    applyPayDueFilter(qb, 'externalInvoice', payDueFilter);
 
     // Fetch paginated results
     const [data, total] = await qb.getManyAndCount();
@@ -936,6 +1152,7 @@ export const getAllExternalInvoices = async (
     }
     applyAgeBucketFilter(baseQb, 'externalInvoice', ageBucket, graceDays);
     applyMissingDataFilter(baseQb, 'externalInvoice', missingData);
+    applyPayDueFilter(baseQb, 'externalInvoice', payDueFilter);
 
     const totalPaid = await baseQb
         .clone()
