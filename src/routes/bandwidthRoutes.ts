@@ -1,11 +1,12 @@
 import { Router, Request, Response, NextFunction, RequestHandler } from 'express';
 import { bandwidthController } from '../controllers/bandwidthController';
-import { authenticateToken } from '../middleware/authMiddleware';
+import { authenticateToken, authorizeAnyPermissions } from '../middleware/authMiddleware';
 
 const router = Router();
 
-// Apply authentication middleware to all bandwidth routes
+// Auth + permission: MikroTik metrics are admin/ops only
 router.use(authenticateToken);
+router.use(authorizeAnyPermissions('admin.analytics.view', 'users.online.view'));
 
 // Helper function to handle async route handlers
 const asyncHandler = (fn: (req: Request, res: Response, next: NextFunction) => Promise<any>): RequestHandler =>
@@ -29,4 +30,4 @@ router.get('/test', asyncHandler(bandwidthController.testConnection.bind(bandwid
 // Get comprehensive bandwidth metrics (combines summary and system data)
 router.get('/metrics', asyncHandler(bandwidthController.getBandwidthMetrics.bind(bandwidthController)));
 
-export default router; 
+export default router;

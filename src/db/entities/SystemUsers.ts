@@ -73,6 +73,22 @@ export class SystemUsers {
   @Column("timestamp", { name: "last_login", nullable: true })
   lastLogin: Date | null;
 
+  @Column("tinyint", {
+    name: "mfa_enabled",
+    width: 1,
+    default: () => "'0'",
+  })
+  mfaEnabled: boolean;
+
+  @Column("varchar", { name: "totp_secret_encrypted", nullable: true, length: 512 })
+  totpSecretEncrypted: string | null;
+
+  @Column("timestamp", { name: "mfa_enrolled_at", nullable: true })
+  mfaEnrolledAt: Date | null;
+
+  @Column("text", { name: "mfa_backup_codes_hash", nullable: true })
+  mfaBackupCodesHash: string | null;
+
   @OneToMany(() => RefreshTokens, (refreshTokens) => refreshTokens.user)
   refreshTokens: RefreshTokens[];
 

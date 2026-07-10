@@ -22,8 +22,15 @@ COPY . .
 # Build TypeScript
 RUN npm run build
 
+# Entrypoint runs migrations then starts the API
+COPY docker/entrypoint.sh /entrypoint.sh
+COPY docker/worker-entrypoint.sh /worker-entrypoint.sh
+# Strip Windows CRLF so Alpine can exec the shebang
+RUN tr -d '\r' < /entrypoint.sh > /entrypoint.sh.tmp && mv /entrypoint.sh.tmp /entrypoint.sh && chmod +x /entrypoint.sh \
+ && tr -d '\r' < /worker-entrypoint.sh > /worker-entrypoint.sh.tmp && mv /worker-entrypoint.sh.tmp /worker-entrypoint.sh && chmod +x /worker-entrypoint.sh
+
 # Expose app port
 EXPOSE 3000
 
 # Run the app
-CMD ["npm", "start"]
+CMD ["sh", "/entrypoint.sh"]

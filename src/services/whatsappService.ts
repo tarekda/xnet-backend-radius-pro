@@ -53,6 +53,7 @@ export function buildReminderTemplateVariables(params: {
     amount?: number | string | null;
     billingMonth?: string | Date | null;
     status?: string | null;
+    checkoutUrl?: string | null;
 }): Record<string, string> {
     const mode = String(process.env.TWILIO_REMINDER_CONTENT_MODE ?? "structured").trim().toLowerCase();
     const message = composeReminderMessage(params);
@@ -65,13 +66,17 @@ export function buildReminderTemplateVariables(params: {
             ? params.amount.toFixed(2)
             : String(params.amount ?? "").trim();
     const name = params.fullName || params.username || "Customer";
-    return {
+    const vars: Record<string, string> = {
         "1": name,
         "2": String(params.invoiceId ?? ""),
         "3": month || "—",
         "4": amountValue || "0.00",
         "5": String(params.status || "unpaid"),
     };
+    if (params.checkoutUrl) {
+        vars["6"] = params.checkoutUrl;
+    }
+    return vars;
 }
 
 /** Variables for Twilio payment-received Content template (placeholders {{1}}…{{3}}). */

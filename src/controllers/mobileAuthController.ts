@@ -6,9 +6,12 @@ import { AppDataSource } from "../db/config";
 import { SystemUsers } from "../db/entities/SystemUsers";
 import { RefreshTokens } from "../db/entities/RefreshTokens";
 import { getEffectivePermissionsForUser } from "../access/permissionService";
+import { getJwtSecret, getRefreshTokenSecret } from "../config/requireSecrets";
 
-const jwtSecret = process.env.JWT_SECRET || "your_jwt_secret";
-const refreshTokenSecret = process.env.REFRESH_TOKEN_SECRET || "your_refresh_jwt_secret";
+const jwtSecret = getJwtSecret();
+const refreshTokenSecret = getRefreshTokenSecret();
+const REFRESH_TOKEN_EXPIRES_IN = process.env.REFRESH_TOKEN_EXPIRES_IN || "30d";
+const ACCESS_TOKEN_EXPIRES_IN = process.env.ACCESS_TOKEN_EXPIRES_IN || "1d";
 
 type MobileUser = {
   id: number;
@@ -57,24 +60,8 @@ export const mobileLogin: RequestHandler = async (req, res) => {
       return;
     }
 
-    const accessToken = jwt.sign(
-      { id: user.id, username: user.username, role: user.role },
-      jwtSecret,
-      { expiresIn: "1d" }
-    );
-    const refreshToken = jwt.sign(
-      { id: user.id, username: user.username, role: user.role },
-      refreshTokenSecret
-    );
-
-    const newRefreshToken = refreshTokenRepository.create({ token: refreshToken, user });
-    await refreshTokenRepository.save(newRefreshToken);
-
-    res.status(200).json({
-      accessToken,
-      refreshToken,
-      user: await toMobileUser(user),
-    });
+    const { completeLoginAfterPassword } = await import("./mfaController");
+    await completeLoginAfterPassword(user, res, "mobile");
     return;
   } catch (e) {
     res.status(500).json({ message: "Internal server error" });

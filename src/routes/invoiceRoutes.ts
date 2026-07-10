@@ -3,11 +3,44 @@ import { Router } from "express";
 import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler } from "../controllers/invoiceController";
 import multer from "multer";
 import { authenticateToken, authorizeAnyPermissions, authorizePermissions, authorizeRoles } from '../middleware/authMiddleware';
-const upload = multer({ dest: "uploads/" }); // temp folder
+const upload = multer({
+  dest: "uploads/",
+  limits: {
+    fileSize: Number(process.env.INVOICE_UPLOAD_MAX_BYTES || 10 * 1024 * 1024), // 10MB
+    files: 1,
+  },
+  fileFilter: (_req, file, cb) => {
+    const name = String(file.originalname || "").toLowerCase();
+    const ok =
+      name.endsWith(".xlsx") ||
+      name.endsWith(".xls") ||
+      name.endsWith(".csv") ||
+      file.mimetype.includes("spreadsheet") ||
+      file.mimetype.includes("excel") ||
+      file.mimetype === "text/csv" ||
+      file.mimetype === "application/vnd.ms-excel" ||
+      file.mimetype === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (!ok) {
+      cb(new Error("Only Excel/CSV invoice files are allowed"));
+      return;
+    }
+    cb(null, true);
+  },
+});
 
 const router = Router();
-router.post("/generate-monthly", generateInvoicesHandler);
-router.get("/", getInvoicesHandler);
+router.post(
+  "/generate-monthly",
+  authenticateToken,
+  authorizeRoles("admin", "manager"),
+  generateInvoicesHandler
+);
+router.get(
+  "/",
+  authenticateToken,
+  authorizeRoles("admin", "manager", "support", "collector"),
+  getInvoicesHandler
+);
 // Add route for paying a single invoice
 router.post("/pay/:invoiceId", authenticateToken, authorizeRoles('admin','manager','support','collector'), payInvoiceHandler);
 router.post("/collect/:invoiceId", authenticateToken, authorizeRoles('collector','manager','admin'), collectInvoiceHandler);
@@ -133,8 +166,18 @@ router.post(
   ),
   runExternalDunningHandler
 );
-router.put("/external/:invoiceId",authenticateToken, updateExternalInvoiceHandler);
-router.delete("/external/:invoiceId", authenticateToken,deleteExternalInvoiceHandler);
+router.put(
+  "/external/:invoiceId",
+  authenticateToken,
+  authorizeRoles("admin", "manager"),
+  updateExternalInvoiceHandler
+);
+router.delete(
+  "/external/:invoiceId",
+  authenticateToken,
+  authorizeRoles("admin", "manager"),
+  deleteExternalInvoiceHandler
+);
 router.post("/external/bulk-delete", authenticateToken, authorizeRoles('admin','manager'), bulkDeleteExternalInvoicesHandler);
 router.get(
   "/external/payment-lines",

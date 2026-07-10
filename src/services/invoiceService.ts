@@ -8,6 +8,7 @@ import { UserDetails } from '../db/entities/UserDetails';
 import { ExternalInvoice } from '../db/entities/ExternalInvoice';
 import { ModificationLog } from '../db/entities/ModificationLog';
 import { invoiceEvents } from '../events/invoiceEvents';
+import { recordInvoicePayment } from '../metrics/metrics';
 
 function isYmdOnly(value: string): boolean {
     return /^\d{4}-\d{2}-\d{2}$/.test(value);
@@ -235,37 +236,54 @@ export const getAllInvoices = async (
 };
 
 export const payInvoice = async (invoiceId: number) => {
-    const invoiceRepo = AppDataSource.getRepository(Invoices);
+    return AppDataSource.transaction(async (manager) => {
+        const invoiceRepo = manager.getRepository(Invoices);
+        const invoice = await invoiceRepo.findOne({
+            where: { id: invoiceId },
+            lock: { mode: "pessimistic_write" },
+        });
+        if (!invoice) {
+            throw new Error("Invoice not found");
+        }
+        // Idempotent: already paid → return as-is (safe to retry)
+        if (String(invoice.status).toLowerCase() === "paid") {
+            recordInvoicePayment("pay", "idempotent");
+            return invoice;
+        }
 
-    const invoice = await invoiceRepo.findOne({ where: { id: invoiceId } });
-    if (!invoice) {
-        throw new Error('Invoice not found');
-    }
-
-    invoice.status = 'paid';
-    invoice.paidAt = new Date(); // Set paidAt as ISO date string
-    await invoiceRepo.save(invoice);
-
-    return invoice;
+        invoice.status = "paid";
+        invoice.paidAt = new Date();
+        await invoiceRepo.save(invoice);
+        recordInvoicePayment("pay", "ok");
+        return invoice;
+    });
 };
 
 export const collectInvoice = async (invoiceId: number, collectorUsername: string, paymentMethod: 'cash' | 'pos' | 'transfer' | 'other' | 'gateway' = 'cash') => {
-    const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
+    return AppDataSource.transaction(async (manager) => {
+        const invoiceRepo = manager.getRepository(ExternalInvoice);
+        const invoice = await invoiceRepo.findOne({
+            where: { id: invoiceId },
+            lock: { mode: "pessimistic_write" },
+        });
+        if (!invoice) {
+            throw new Error("Invoice not found");
+        }
+        if (String(invoice.status).toLowerCase() === "paid") {
+            recordInvoicePayment("collect", "idempotent");
+            return invoice;
+        }
 
-    const invoice = await invoiceRepo.findOne({ where: { id: invoiceId } });
-    if (!invoice) {
-        throw new Error('Invoice not found');
-    }
+        invoice.status = "paid";
+        invoice.paidAt = new Date();
+        (invoice as any).paymentMethod = paymentMethod;
+        (invoice as any).collectedBy = collectorUsername;
+        (invoice as any).collectedAt = new Date();
 
-    // Mark as collected and paid in one step
-    invoice.status = 'paid';
-    invoice.paidAt = new Date();
-    (invoice as any).paymentMethod = paymentMethod;
-    (invoice as any).collectedBy = collectorUsername;
-    (invoice as any).collectedAt = new Date();
-
-    await invoiceRepo.save(invoice);
-    return invoice;
+        await invoiceRepo.save(invoice);
+        recordInvoicePayment("collect", "ok");
+        return invoice;
+    });
 };
 
 export const reconcileInvoiceCash = async (
@@ -369,48 +387,76 @@ export const reconcileBulkCash = async (params: {
 export const payExternalInvoice = async (
     invoiceId: number,
     actorUsername: string,
-    paymentMethod: 'cash' | 'pos' | 'transfer' | 'other' | 'gateway' = 'cash'
+    paymentMethod: 'cash' | 'pos' | 'transfer' | 'other' | 'gateway' | 'wallet' = 'cash',
+    extras?: { paymentReference?: string | null; paymentProvider?: string | null }
 ) => {
-    const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
+    return AppDataSource.transaction(async (manager) => {
+        const invoiceRepo = manager.getRepository(ExternalInvoice);
+        const invoice = await invoiceRepo.findOne({
+            where: { id: invoiceId },
+            lock: { mode: "pessimistic_write" },
+        });
+        if (!invoice) {
+            throw new Error("Invoice not found");
+        }
+        // Idempotent: double-submit / retry must not re-fire side effects
+        if (String(invoice.status).toLowerCase() === "paid") {
+            recordInvoicePayment("external_pay", "idempotent");
+            return invoice;
+        }
 
-    const invoice = await invoiceRepo.findOne({ where: { id: invoiceId } });
-    if (!invoice) {
-        throw new Error('Invoice not found');
-    }
+        invoice.status = "paid";
+        invoice.paidAt = new Date();
+        (invoice as any).paymentMethod = paymentMethod;
+        (invoice as any).collectedBy = actorUsername;
+        (invoice as any).collectedAt = new Date();
+        if (extras?.paymentReference) {
+            invoice.paymentReference = String(extras.paymentReference).slice(0, 128);
+        }
+        if (extras?.paymentProvider) {
+            invoice.paymentProvider = String(extras.paymentProvider).slice(0, 32);
+        } else if (paymentMethod === "gateway") {
+            invoice.paymentProvider = invoice.paymentProvider || "whish";
+        }
 
-    // Mark as paid and also capture collection info for EOD reconciliation
-    invoice.status = 'paid';
-    invoice.paidAt = new Date();
-    (invoice as any).paymentMethod = paymentMethod;
-    (invoice as any).collectedBy = actorUsername;
-    (invoice as any).collectedAt = new Date();
-
-    await invoiceRepo.save(invoice);
-
-    return invoice;
+        await invoiceRepo.save(invoice);
+        recordInvoicePayment("external_pay", "ok");
+        return invoice;
+    });
 };
 
 export const unpayExternalInvoice = async (invoiceId: number, actorUsername: string) => {
-    const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
-    const invoice = await invoiceRepo.findOne({ where: { id: invoiceId } });
-    if (!invoice) {
-        throw new Error('Invoice not found');
-    }
+    return AppDataSource.transaction(async (manager) => {
+        const invoiceRepo = manager.getRepository(ExternalInvoice);
+        const invoice = await invoiceRepo.findOne({
+            where: { id: invoiceId },
+            lock: { mode: "pessimistic_write" },
+        });
+        if (!invoice) {
+            throw new Error("Invoice not found");
+        }
+        if (String(invoice.status).toLowerCase() !== "paid") {
+            return invoice;
+        }
 
-    invoice.status = 'unpaid';
-    invoice.paidAt = null;
-    (invoice as any).paymentMethod = null;
-    (invoice as any).collectedBy = null;
-    (invoice as any).collectedAt = null;
-    (invoice as any).cashReconciled = false;
-    (invoice as any).reconciledBy = null;
-    (invoice as any).reconciledAt = null;
-    (invoice as any).modifiedBy = actorUsername;
-    (invoice as any).modifiedAt = new Date();
-    (invoice as any).lastAction = 'UNPAY';
+        invoice.status = "unpaid";
+        invoice.paidAt = null;
+        (invoice as any).paymentMethod = null;
+        (invoice as any).collectedBy = null;
+        invoice.paymentReference = null;
+        invoice.paymentProvider = null;
+        (invoice as any).collectedAt = null;
+        (invoice as any).cashReconciled = false;
+        (invoice as any).reconciledBy = null;
+        (invoice as any).reconciledAt = null;
+        (invoice as any).modifiedBy = actorUsername;
+        (invoice as any).modifiedAt = new Date();
+        (invoice as any).lastAction = "UNPAY";
 
-    await invoiceRepo.save(invoice);
-    return invoice;
+        await invoiceRepo.save(invoice);
+        recordInvoicePayment("unpay", "ok");
+        return invoice;
+    });
 };
 
 

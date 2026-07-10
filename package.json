@@ -5,6 +5,8 @@
   "main": "server.js",
   "scripts": {
     "test": "jest",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "nodemon",
@@ -58,6 +60,7 @@
     "mysql2": "^3.12.0",
     "node-cron": "^4.6.0",
     "node-routeros": "^1.6.8",
+    "otplib": "12.0.1",
     "ping": "^0.4.4",
     "prom-client": "^15.1.3",
     "radius": "^1.1.4",

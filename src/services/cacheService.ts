@@ -1,29 +1,43 @@
 // CacheService.ts
-import { redisClient } from '../redisClient';
+import { redisClient } from "../redisClient";
 
 export class CacheService {
-  async deleteCacheKeys(pattern: string = 'user:*'): Promise<void> {
+  /**
+   * Delete keys matching a glob pattern using SCAN (non-blocking) instead of KEYS.
+   */
+  async deleteCacheKeys(pattern: string = "user:*"): Promise<void> {
     try {
-      // Ensure the client is connected before using it
       if (!redisClient.isOpen) {
         await redisClient.connect();
       }
-      const keys = await redisClient.keys(pattern);
-      if (keys.length > 0) {
-        await redisClient.del(keys);
-        console.log(`Deleted keys: ${keys.join(', ')}`);
-      } else {
-        console.log('No cache keys found to delete.');
+
+      let cursor = 0;
+      let deleted = 0;
+      do {
+        const result = await redisClient.scan(cursor, {
+          MATCH: pattern,
+          COUNT: 100,
+        });
+        cursor = typeof result.cursor === "number" ? result.cursor : Number(result.cursor);
+        const keys = result.keys ?? [];
+        if (keys.length > 0) {
+          await redisClient.del(keys);
+          deleted += keys.length;
+        }
+      } while (cursor !== 0);
+
+      if (deleted > 0) {
+        console.log(`Deleted ${deleted} cache key(s) matching ${pattern}`);
       }
     } catch (error) {
-      console.error('Error deleting cache keys:', error);
+      console.error("Error deleting cache keys:", error);
     }
   }
-  
+
   async disconnect(): Promise<void> {
     if (redisClient.isOpen) {
       await redisClient.disconnect();
-      console.log('Disconnected from Redis');
+      console.log("Disconnected from Redis");
     }
   }
 }

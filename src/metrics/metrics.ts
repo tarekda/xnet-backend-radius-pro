@@ -31,8 +31,68 @@ const websocketClients = new client.Gauge({
   registers: [register],
 });
 
+/** Billing / RADIUS ops counters for Grafana SLOs */
+const invoicePaymentsTotal = new client.Counter({
+  name: "invoice_payments_total",
+  help: "Invoice payment / collect / unpay outcomes",
+  labelNames: ["kind", "result"] as const,
+  registers: [register],
+});
+
+const sessionDisconnectsTotal = new client.Counter({
+  name: "session_disconnects_total",
+  help: "Session disconnect / CoA attempts",
+  labelNames: ["method", "result"] as const,
+  registers: [register],
+});
+
+const dunningRunsTotal = new client.Counter({
+  name: "dunning_runs_total",
+  help: "External invoice dunning job runs",
+  labelNames: ["result"] as const,
+  registers: [register],
+});
+
+const dunningActionsTotal = new client.Counter({
+  name: "dunning_actions_total",
+  help: "Dunning actions applied (remind/throttle/suspend)",
+  labelNames: ["action"] as const,
+  registers: [register],
+});
+
+const quotaResetsTotal = new client.Counter({
+  name: "quota_resets_total",
+  help: "Daily/monthly quota reset operations",
+  labelNames: ["scope", "result"] as const,
+  registers: [register],
+});
+
 export function setWebsocketClients(count: number) {
   websocketClients.set(count);
+}
+
+export function recordInvoicePayment(
+  kind: "pay" | "collect" | "unpay" | "external_pay",
+  result: "ok" | "error" | "idempotent"
+) {
+  invoicePaymentsTotal.inc({ kind, result });
+}
+
+export function recordSessionDisconnect(method: string, result: "ok" | "error") {
+  sessionDisconnectsTotal.inc({ method: method || "unknown", result });
+}
+
+export function recordDunningRun(result: "ok" | "error", actions?: Record<string, number>) {
+  dunningRunsTotal.inc({ result });
+  if (actions) {
+    for (const [action, count] of Object.entries(actions)) {
+      if (count > 0) dunningActionsTotal.inc({ action }, count);
+    }
+  }
+}
+
+export function recordQuotaReset(scope: "daily" | "monthly", result: "ok" | "error") {
+  quotaResetsTotal.inc({ scope, result });
 }
 
 function getRouteLabel(req: Request): string {
@@ -57,4 +117,3 @@ export function metricsMiddleware(req: Request, res: Response, next: NextFunctio
   });
   next();
 }
-

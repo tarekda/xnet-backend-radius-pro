@@ -17,6 +17,7 @@ import eventBus from '../bus/eventBusSingleton';
 import { CacheService } from '../services/cacheService';
 import { QuotaService } from '../services/quotaServices';
 import { bandwidthService } from '../services/bandwidthService';
+import { recordSessionDisconnect } from '../metrics/metrics';
 import { UserDetails } from '../db/entities/UserDetails';
 import { SessionTracking } from '../db/entities/SessionTracking';
 import { Invoices } from '../db/entities/Invoices';
@@ -1015,6 +1016,15 @@ export const UserController = {
         | { ok: true; method: "radclient"; stdout: string; stderr: string }
         | { ok: false; method: "none" | "radclient"; error: string; stdout?: string; stderr?: string }
     > => {
+        type DisconnectResult =
+            | { ok: true; method: "mikrotik-api"; result: { pppRemoved: number; hotspotRemoved: number } }
+            | { ok: true; method: "radclient"; stdout: string; stderr: string }
+            | { ok: false; method: "none" | "radclient"; error: string; stdout?: string; stderr?: string };
+        const finish = (result: DisconnectResult): DisconnectResult => {
+            recordSessionDisconnect(result.method, result.ok ? "ok" : "error");
+            return result;
+        };
+
         const withTimeout = async <T,>(p: Promise<T>, ms: number, label: string): Promise<T> => {
             let t: NodeJS.Timeout | undefined;
             try {
@@ -1036,7 +1046,7 @@ export const UserController = {
             // If we actually removed something, treat as success and stop here.
             if ((apiResult.pppRemoved || 0) + (apiResult.hotspotRemoved || 0) > 0) {
                 console.log(`✅ Disconnected ${username} via MikroTik API`, apiResult);
-                return { ok: true, method: "mikrotik-api", result: apiResult };
+                return finish({ ok: true, method: "mikrotik-api", result: apiResult });
             }
             // No active entry found via API. Fall back to DM if we have NAS info.
             console.warn(`⚠️ MikroTik API did not find an active session for ${username} (pppRemoved=0, hotspotRemoved=0). Will try Disconnect-Request if possible.`);
@@ -1051,7 +1061,7 @@ export const UserController = {
                 : "MikroTik API failed/unavailable";
             const error = `Cannot disconnect ${username}: missing nasIp/secret and ${hint}`;
             console.error(`❌ ${error}`);
-            return { ok: false, method: "none", error };
+            return finish({ ok: false, method: "none", error });
         }
 
         const coaPort = typeof port === "number" && Number.isFinite(port) ? port : 3799; // MikroTik default for CoA/DM
@@ -1067,7 +1077,7 @@ export const UserController = {
                 console.warn(`⚠️ radclient stderr for ${username}:`, stderr);
             }
             console.log(`✅ User ${username} disconnected via radclient`, { nasIp, coaPort });
-            return { ok: true, method: "radclient", stdout: stdout ?? "", stderr: stderr ?? "" };
+            return finish({ ok: true, method: "radclient", stdout: stdout ?? "", stderr: stderr ?? "" });
         } catch (err: any) {
             const error = err?.message || String(err);
             const stderr = String(err?.stderr ?? "");
@@ -1080,13 +1090,13 @@ export const UserController = {
 
             if (!looksLikeMissingRadclient) {
                 console.error(`❌ Error disconnecting user ${username} via radclient:`, error);
-                return {
+                return finish({
                     ok: false,
                     method: "radclient",
                     error,
                     stdout: err?.stdout,
                     stderr: err?.stderr,
-                };
+                });
             }
 
             try {
@@ -1131,12 +1141,12 @@ export const UserController = {
                 });
 
                 if (!response.ok) {
-                    return { ok: false, method: "none", error: `Disconnect UDP send failed: ${response.msg}` };
+                    return finish({ ok: false, method: "none", error: `Disconnect UDP send failed: ${response.msg}` });
                 }
                 console.log(`✅ User ${username} disconnect via UDP`, { nasIp, coaPort, msg: response.msg });
-                return { ok: true, method: "radclient", stdout: response.msg, stderr: "" };
+                return finish({ ok: true, method: "radclient", stdout: response.msg, stderr: "" });
             } catch (e: any) {
-                return { ok: false, method: "none", error: `Disconnect fallback failed: ${e?.message || String(e)}` };
+                return finish({ ok: false, method: "none", error: `Disconnect fallback failed: ${e?.message || String(e)}` });
             }
         }
     },

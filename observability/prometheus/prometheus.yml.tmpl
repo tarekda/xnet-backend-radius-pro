@@ -11,6 +11,11 @@ scrape_configs:
     static_configs:
       - targets: ["app:3000"]
 
+  # FreeRADIUS Status-Server exporter (published on host :9812 by radius-docker-image)
+  - job_name: freeradius
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9812"]
+
 remote_write:
   - url: __PROM_REMOTE_WRITE_URL__
-

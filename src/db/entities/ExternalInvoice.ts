@@ -18,6 +18,24 @@ export class ExternalInvoice {
   @Column("float", { name: "amount", precision: 12 })
   amount: number;
 
+  @Column("float", { name: "subtotal_amount", nullable: true })
+  subtotalAmount: number | null;
+
+  @Column("float", { name: "tax_rate", nullable: true })
+  taxRate: number | null;
+
+  @Column("float", { name: "tax_amount", nullable: true })
+  taxAmount: number | null;
+
+  @Column("float", { name: "total_amount", nullable: true })
+  totalAmount: number | null;
+
+  @Column("varchar", { name: "document_type", length: 20, default: () => "'invoice'" })
+  documentType: "invoice" | "credit_note";
+
+  @Column("int", { name: "parent_invoice_id", nullable: true })
+  parentInvoiceId: number | null;
+
   @Column("varchar", { name: "status", length: 10, default: () => "'unpaid'" })
   status: string;
 
@@ -45,6 +63,14 @@ export class ExternalInvoice {
 
   @Column("varchar", { name: "paymentMethod", nullable: true, length: 20 })
   paymentMethod: string | null;
+
+  /** Whish / gateway transaction or reference number */
+  @Column("varchar", { name: "payment_reference", nullable: true, length: 128 })
+  paymentReference: string | null;
+
+  /** e.g. whish, stub, cash desk */
+  @Column("varchar", { name: "payment_provider", nullable: true, length: 32 })
+  paymentProvider: string | null;
 
   @Column("varchar", { name: "collectedBy", nullable: true, length: 64 })
   collectedBy: string | null;

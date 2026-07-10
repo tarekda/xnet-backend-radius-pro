@@ -4,6 +4,7 @@ import { Raduserprofile } from '../db/entities/Raduserprofile';
 import { CacheService  } from './cacheService';
 import { EventBus } from '../bus/eventBus';
 import { sqlMonthlyCycleStart } from '../utils/quotaCycle';
+import { recordQuotaReset } from '../metrics/metrics';
 
 export class QuotaService {
   private dataSource: DataSource;
@@ -78,9 +79,11 @@ export class QuotaService {
         username,
         reason: 'dailyQuotaReset'
       });
+      recordQuotaReset("daily", "ok");
     } catch (error) {
       console.error('Error resetting daily quota:', error);
       await queryRunner.rollbackTransaction();
+      recordQuotaReset("daily", "error");
       throw error;
     } finally {
       await queryRunner.release();
@@ -170,9 +173,11 @@ export class QuotaService {
         username,
         reason: 'monthlyQuotaReset'
       });
+      recordQuotaReset("monthly", "ok");
     } catch (error) {
       console.error('Error resetting monthly quota:', error);
       await queryRunner.rollbackTransaction();
+      recordQuotaReset("monthly", "error");
       throw error;
     } finally {
       await queryRunner.release();

@@ -31,7 +31,10 @@ import { WebSocket, WebSocketServer } from 'ws';
 import invoiceRoutes from './routes/invoiceRoutes';
 import alertRoutes from './routes/alertRoutes';
 import bandwidthRoutes from './routes/bandwidthRoutes';
+import analyticsRoutes from './routes/analyticsRoutes';
 import expenseRoutes from './routes/expenseRoutes';
+import { subscriberAuthRoutes, subscriberApiRoutes } from './routes/subscriberRoutes';
+import paymentGatewayRoutes, { paymentWebhookRoutes } from './routes/paymentGatewayRoutes';
 import accessRoutes from './routes/accessRoutes';
 import resellerRoutes from './routes/resellerRoutes';
 import auditRoutes from './routes/auditRoutes';
@@ -40,7 +43,6 @@ import cableVisionRoutes from './routes/cableVisionRoutes';
 import aiRoutes from './routes/aiRoutes';
 import './events/invoiceListeners'
 import cors from 'cors';
-import eventBus from './bus/eventBusSingleton';
 import { beginShutdown } from './state/shutdown';
 import { redisClient } from './redisClient';
 import { AppDataSource } from './db/config';
@@ -48,8 +50,11 @@ import { metricsMiddleware, register, setWebsocketClients } from './metrics/metr
 import { startBackupScheduler } from "./backups/scheduler";
 import { runExpirySessionDisconnectJob } from "./jobs/expirySessionDisconnectJob";
 import { startConnectionLogsMaintenanceScheduler } from "./jobs/connectionLogsMaintenance";
+import { assertProductionSecrets, getJwtSecret, getRadiusSecret } from "./config/requireSecrets";
+import jwt from "jsonwebtoken";
 
 dotenv.config();
+assertProductionSecrets();
 
 const app = express();
 
@@ -92,7 +97,27 @@ app.use(metricsMiddleware);
 // Store connected clients
 const clients = new Set();
 
-wss.on('connection', (ws: any) => {
+wss.on('connection', (ws: any, req: any) => {
+    // Require a valid JWT before accepting the socket (query ?token= or Authorization header).
+    try {
+      const host = req?.headers?.host || "localhost";
+      const url = new URL(req?.url || "/", `http://${host}`);
+      const headerAuth = String(req?.headers?.authorization || "");
+      const headerToken = headerAuth.toLowerCase().startsWith("bearer ")
+        ? headerAuth.slice(7).trim()
+        : "";
+      const token = String(url.searchParams.get("token") || headerToken || "").trim();
+      if (!token) {
+        ws.close(4401, "Unauthorized");
+        return;
+      }
+      jwt.verify(token, getJwtSecret());
+      ws.isAuthenticated = true;
+    } catch {
+      ws.close(4401, "Unauthorized");
+      return;
+    }
+
     console.log('✅ WebSocket client connected');
     clients.add(ws);
     setWebsocketClients(clients.size);
@@ -105,40 +130,21 @@ wss.on('connection', (ws: any) => {
         watcher.started = true;
     }
 
-    // Handle app-level websocket messages
-    ws.on('message', async (message: any) => {
+    // Clients may only receive broadcasts. Never accept client-originated
+    // business events (e.g. INVOICE_PAID) — that was an unauthenticated injection path.
+    ws.on('message', (message: any) => {
       try {
         const raw = typeof message === "string" ? message : message?.toString?.() ?? "";
         const text = String(raw || "").trim();
         if (!text) return;
-
-        // Ignore non-JSON frames (e.g. proxy/STOMP CONNECT prefaces).
         const looksJson = text.startsWith("{") || text.startsWith("[");
-        if (!looksJson) {
-          console.warn("Ignoring non-JSON websocket frame");
-          return;
-        }
-
+        if (!looksJson) return;
         const data = JSON.parse(text);
-        if (!data || typeof data !== "object") return;
-
-        if (ws.readyState === WebSocket.OPEN) {
-          try {
-            await eventBus.publish({
-              type: 'INVOICE_PAID',
-              ...data
-            });
-          } catch (error) {
-            console.error('Error publishing notification:', error);
-          }
-
-          ws.send(JSON.stringify({
-            type: 'INVOICE_PAID',
-            ...data
-          }));
+        if (data?.type === "ping" && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
         }
-      } catch (error) {
-        console.error('Error handling message:', error);
+      } catch {
+        // ignore malformed frames
       }
     });
 
@@ -162,9 +168,7 @@ export const broadcastMessage = (message: any) => {
 // Apply security middlewares
 securityMiddleware(app);
 
-const jwtSecret = process.env.JWT_SECRET || 'your_jwt_secret';
-
-app.set("trust proxy", true);
+app.set("trust proxy", 1);
 
 // Use the requestLogger middleware
 app.use(requestLogger);
@@ -194,6 +198,13 @@ app.use("/api/invoices", invoiceRoutes);
 app.use("/api/alerts", alertRoutes);
 
 app.use("/api/bandwidth", bandwidthRoutes);
+
+app.use("/api/analytics", analyticsRoutes);
+
+app.use("/api/auth/subscriber", subscriberAuthRoutes);
+app.use("/api/subscriber", subscriberApiRoutes);
+app.use("/api/invoices", paymentGatewayRoutes);
+app.use("/api/webhooks/payments", paymentWebhookRoutes);
 
 app.use("/api/expenses", expenseRoutes);
 
@@ -258,7 +269,7 @@ async function logSession(username: string, action: string): Promise<void> {
 }
 
 radiusServer.on('message', async (msg, rinfo) => {
-    const packet = radius.decode({ packet: msg, secret: process.env.RADIUS_SECRET || 'your_secret' });
+    const packet = radius.decode({ packet: msg, secret: getRadiusSecret() });
 
     // Check if the packet is from RADIUS
     if (!packet) {
@@ -321,8 +332,13 @@ app.get('/', (req, res) => {
 // Error handling middleware
 app.use(errorHandler);
 
-// Start the consumer in the background
-startConsumer().catch((err) => console.error('Consumer error:', err));
+// Start the consumer in the background (disable with START_USER_ACTIONS_CONSUMER=0 when using worker profile)
+const startConsumerFlag = String(process.env.START_USER_ACTIONS_CONSUMER ?? "1").toLowerCase();
+if (startConsumerFlag !== "0" && startConsumerFlag !== "false") {
+  startConsumer().catch((err) => console.error("Consumer error:", err));
+} else {
+  console.log("user_actions consumer disabled in this process (START_USER_ACTIONS_CONSUMER=0)");
+}
 
 // Initialize database before starting server
 initializeDB().then(async () => {

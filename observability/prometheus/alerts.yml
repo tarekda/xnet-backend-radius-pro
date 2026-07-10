@@ -36,3 +36,28 @@ groups:
           summary: High p95 latency
           description: p95 request latency is > 1s for 10 minutes.
 
+  - name: freeradius_noc
+    rules:
+      - alert: FreeRadiusDown
+        expr: freeradius_up == 0 or up{job="freeradius"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: FreeRADIUS is down
+          description: Status-Server probe or Prometheus scrape for FreeRADIUS failed.
+
+      - alert: FreeRadiusHighRejectRate
+        expr: |
+          (
+            rate(freeradius_access_rejects_total[5m])
+            /
+            clamp_min(rate(freeradius_access_requests_total[5m]), 0.001)
+          ) > 0.35
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: High RADIUS reject rate
+          description: More than 35% of Access-Requests are rejects over 5m.
+

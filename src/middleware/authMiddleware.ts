@@ -3,8 +3,9 @@ import jwt from 'jsonwebtoken';
 import { AppDataSource } from '../db/config';
 import { SystemUsers } from '../db/entities/SystemUsers';
 import { getEffectivePermissionsForUser } from '../access/permissionService';
+import { getJwtSecret } from '../config/requireSecrets';
 
-const jwtSecret = process.env.JWT_SECRET || 'your_jwt_secret';
+const jwtSecret = getJwtSecret();
 
 export const authenticateToken = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   const authHeader = req.headers['authorization'];

@@ -48,9 +48,25 @@ import { Invoices } from "../db/entities/Invoices";
 import { UserDetails } from "../db/entities/UserDetails";
 import { Raduserprofile } from "../db/entities/Raduserprofile";
 import { composePaidMessage, sendWhatsAppMessage, sendWhatsAppMessageStrict, getWhatsAppConfigStatus, getTwilioCredentialDiagnostics, testTwilioCredentials, composeReminderMessage, buildReminderTemplateVariables, buildPaymentTemplateVariables } from "../services/whatsappService";
+import { createPaymentIntent, getOpenCheckoutUrl } from "../services/paymentGatewayService";
+import { coerceToAppError } from "../errors/AppError";
+import { recordDunningRun } from "../metrics/metrics";
 
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
   res.status(status).json({ success, message, data });
+};
+
+const sendCaughtError = (res: Response, error: unknown, fallbackMessage: string) => {
+  const appErr = coerceToAppError(error);
+  if (appErr.statusCode >= 500) {
+    console.error(fallbackMessage, error);
+  }
+  return sendResponse(
+    res,
+    false,
+    appErr.statusCode,
+    appErr.expose ? appErr.message : fallbackMessage
+  );
 };
 
 type DunningCandidate = {
@@ -387,6 +403,11 @@ const executeExternalDunning = async (params: {
     });
   }
 
+  recordDunningRun("ok", {
+    remind: result.actionSummary.remind,
+    throttle: result.actionSummary.throttle,
+    suspend: result.actionSummary.suspend,
+  });
   return result;
 };
 
@@ -469,8 +490,7 @@ export const payInvoiceHandler = async (req: Request, res: Response) => {
       }
     })();
   } catch (error) {
-    console.error("Error paying invoice:", error);
-    res.status(500).json({ message: "Failed to pay invoice" });
+    return sendCaughtError(res, error, "Failed to pay invoice");
   }
 };
 
@@ -484,8 +504,7 @@ export const bulkPayInvoicesHandler = async (req: Request, res: Response) => {
     const invoices = await bulkPayInvoices(invoiceIds);
     sendResponse(res, true, 200, "Invoices paid successfully", invoices);
   } catch (error) {
-    console.error("Error paying invoices:", error);
-    res.status(500).json({ message: "Failed to pay invoices" });
+    return sendCaughtError(res, error, "Failed to pay invoices");
   }
 };
 
@@ -510,8 +529,7 @@ export const collectInvoiceHandler = async (req: Request, res: Response) => {
 
     sendResponse(res, true, 200, "Invoice collected and marked as paid", invoice);
   } catch (error) {
-    console.error("Error collecting invoice:", error);
-    res.status(500).json({ message: "Failed to collect invoice" });
+    return sendCaughtError(res, error, "Failed to collect invoice");
   }
 };
 
@@ -947,8 +965,21 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
 
     const paymentMethod = (req.body?.paymentMethod || 'cash') as 'cash' | 'pos' | 'transfer' | 'other' | 'gateway';
     const actor = req.user?.username || 'system';
+    const paymentReference = req.body?.paymentReference
+      ? String(req.body.paymentReference).trim()
+      : req.body?.whishReference
+        ? String(req.body.whishReference).trim()
+        : undefined;
+    const paymentProvider = req.body?.paymentProvider
+      ? String(req.body.paymentProvider).trim()
+      : paymentMethod === "gateway" || paymentReference
+        ? "whish"
+        : undefined;
 
-    const invoice = await payExternalInvoice(invoiceId, actor, paymentMethod);
+    const invoice = await payExternalInvoice(invoiceId, actor, paymentMethod, {
+      paymentReference,
+      paymentProvider,
+    });
 
     // Emit modification event
     invoiceEvents.emitModification({
@@ -992,8 +1023,7 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
       }
     })();
   } catch (error) {
-    console.error("Error paying invoice:", error);
-    res.status(500).json({ message: "Failed to pay invoice" });
+    return sendCaughtError(res, error, "Failed to pay invoice");
   }
 };
 
@@ -1017,10 +1047,7 @@ export const unpayExternalInvoiceHandler = async (req: Request, res: Response) =
 
     sendResponse(res, true, 200, "Invoice marked as unpaid", invoice);
   } catch (error) {
-    console.error("Error unpaying external invoice:", error);
-    const message = (error as any)?.message || "Failed to unpay invoice";
-    if (message === 'Invoice not found') return sendResponse(res, false, 404, message);
-    res.status(500).json({ message: "Failed to unpay invoice" });
+    return sendCaughtError(res, error, "Failed to unpay invoice");
   }
 };
 
@@ -1052,6 +1079,17 @@ export const remindExternalInvoiceHandler = async (req: Request, res: Response) 
       );
     }
 
+    let checkoutUrl: string | null = null;
+    try {
+      checkoutUrl = await getOpenCheckoutUrl(invoiceId);
+      if (!checkoutUrl && invoice.status !== "paid") {
+        const intent = await createPaymentIntent(invoiceId);
+        checkoutUrl = intent.checkoutUrl || null;
+      }
+    } catch (e) {
+      console.warn("Reminder checkout URL skipped:", (e as Error)?.message || e);
+    }
+
     const message = composeReminderMessage({
       fullName: invoice.fullName,
       username: invoice.username,
@@ -1072,6 +1110,7 @@ export const remindExternalInvoiceHandler = async (req: Request, res: Response) 
         amount: invoice.amount,
         billingMonth: invoice.billingMonth,
         status: invoice.status,
+        checkoutUrl,
       }),
     });
 

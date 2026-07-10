@@ -8,6 +8,7 @@ try {
 }
 
 import { Logger } from '../logging/logging';
+import { getMikroTikPassword } from '../config/requireSecrets';
 
 const logger = Logger.getInstance();
 
@@ -58,7 +59,7 @@ export class BandwidthService {
     this.routerIP = process.env.MIKROTIK_IP || '172.9.16.2';
     // Backwards-compat: some envs use MIKROTIK_USER
     this.username = process.env.MIKROTIK_USERNAME || process.env.MIKROTIK_USER || 'apiuser';
-    this.password = process.env.MIKROTIK_PASSWORD || '123456';
+    this.password = getMikroTikPassword() || '';
     this.apiPort = parseInt(process.env.MIKROTIK_API_PORT || '8728');
     this.monitorInterface = process.env.MIKROTIK_MONITOR_INTERFACE || 'ether6-OUT';
 

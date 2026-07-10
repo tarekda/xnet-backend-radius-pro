@@ -37,6 +37,10 @@ import { ResellerLedgerEntry } from './entities/ResellerLedgerEntry';
 import { CableVisionAccount } from './entities/CableVisionAccount';
 import { CableVisionProfile } from './entities/CableVisionProfile';
 import { CableVisionInvoice } from './entities/CableVisionInvoice';
+import { SubscriberRefreshTokens } from './entities/SubscriberRefreshTokens';
+import { PaymentIntent } from './entities/PaymentIntent';
+import { WhishPaymentClaim } from './entities/WhishPaymentClaim';
+import { SubscriberWalletEntry } from './entities/SubscriberWalletEntry';
 
 // Create entities array with explicit references
 const entities = [
@@ -58,6 +62,10 @@ const entities = [
     Radusagestats,
     Raduserprofile,
     RefreshTokens,
+    SubscriberRefreshTokens,
+    PaymentIntent,
+    WhishPaymentClaim,
+    SubscriberWalletEntry,
     Role,
     RolePermission,
     Reseller,
@@ -79,7 +87,7 @@ export const AppDataSource = new DataSource({
     username: process.env.DB_USERNAME || "radius",
     password: process.env.DB_PASSWORD || "password",
     database: process.env.DB_NAME || "radius",
-    synchronize: process.env.NODE_ENV !== 'production',
+    synchronize: process.env.TYPEORM_SYNCHRONIZE === "true",
     logging: process.env.DB_LOGGING_ENABLED === 'true',
     entities: entities,
     migrations: [
