@@ -76,41 +76,68 @@ export class BandwidthService {
       this.conn = null;
       logger.warn('BandwidthService running in MOCK MODE – node-routeros module not available');
     } else {
-      this.conn = new RouterOSAPI({
-        host: this.routerIP,
-        user: this.username,
-        password: this.password,
-        port: this.apiPort,
-        timeout: this.commandTimeoutMs
-      });
+      this.createConnection();
       logger.info('BandwidthService initialised in REAL MODE – MikroTik integration enabled');
-
-      // --------------------------------------------------------------------
-      // Attach low-level error & timeout handlers
-      // --------------------------------------------------------------------
-      // The node-routeros connector emits an "error" event (and sometimes a
-      // RosException) when the underlying socket times out or encounters
-      // another fatal issue.  If no listener is registered, Node treats it as
-      // an unhandled exception and the whole process crashes.  By attaching a
-      // defensive listener we make sure the error is logged and let the
-      // higher-level promise rejection flow handle it gracefully.
-      this.conn.on('error', (err: any) => {
-        // Log and swallow – callers will also receive a rejected promise.
-        logger.error('RouterOSAPI emitted an error event:', err?.message || err);
-
-        // Ensure we are in a clean state – close the connection so the next
-        // operation can trigger a fresh reconnect via ensureConnection().
-        if (this.conn.connected) {
-          this.conn.close();
-        }
-      });
-
-      // "timeout" events are not always re-emitted as errors by the library
-      // but can still crash the process if unhandled.
-      this.conn.on('timeout', () => {
-        logger.warn('RouterOSAPI connection timed out');
-      });
     }
+  }
+
+  private createConnection(): void {
+    this.conn = new RouterOSAPI({
+      host: this.routerIP,
+      user: this.username,
+      password: this.password,
+      port: this.apiPort,
+      timeout: this.commandTimeoutMs,
+      // Send periodic pings so idle connections aren't silently dropped by
+      // the router / NAT, which previously left us with a socket that still
+      // reported connected=true but timed out on every command.
+      keepalive: true
+    });
+
+    // --------------------------------------------------------------------
+    // Attach low-level error & timeout handlers
+    // --------------------------------------------------------------------
+    // The node-routeros connector emits an "error" event (and sometimes a
+    // RosException) when the underlying socket times out or encounters
+    // another fatal issue.  If no listener is registered, Node treats it as
+    // an unhandled exception and the whole process crashes.  By attaching a
+    // defensive listener we make sure the error is logged and let the
+    // higher-level promise rejection flow handle it gracefully.
+    this.conn.on('error', (err: any) => {
+      // Log and swallow – callers will also receive a rejected promise.
+      logger.error('RouterOSAPI emitted an error event:', err?.message || err);
+
+      // Ensure we are in a clean state – close the connection so the next
+      // operation can trigger a fresh reconnect via ensureConnection().
+      if (this.conn.connected) {
+        this.conn.close();
+      }
+    });
+
+    // "timeout" events are not always re-emitted as errors by the library
+    // but can still crash the process if unhandled.
+    this.conn.on('timeout', () => {
+      logger.warn('RouterOSAPI connection timed out');
+    });
+  }
+
+  /**
+   * Tear down a (possibly wedged) connection and build a fresh instance so
+   * the next ensureConnection() performs a clean reconnect. Called when a
+   * command fails even though the socket claims to be connected — the
+   * classic "stale connection" state after long idle periods.
+   */
+  private resetConnection(): void {
+    if (this.mockMode) return;
+    logger.warn('Resetting MikroTik connection after command failure');
+    try {
+      this.conn?.removeAllListeners?.();
+      this.conn?.close?.();
+    } catch {
+      // ignore – socket may already be dead
+    }
+    this.connecting = null;
+    this.createConnection();
   }
 
   /* ------------------------------------------------------------------
@@ -195,6 +222,7 @@ export class BandwidthService {
       'interface monitor-traffic'
     ).catch((e: any) => {
       logger.warn('getInterfaceTraffic failed:', e?.message || e);
+      this.resetConnection();
       return [];
     })) as any[];
 
@@ -280,9 +308,15 @@ export class BandwidthService {
       'system resource'
     ).catch((e: any) => {
       logger.warn('getSystemResources failed:', e?.message || e);
+      this.resetConnection();
       return [];
     })) as any[];
-    if (!res.length) throw new Error('No system resource data');
+    if (!res.length) {
+      // Router is flapping — serve stale cache if we have one so the
+      // dashboard keeps rendering instead of turning into a 500.
+      if (this.cache.systemResources) return this.cache.systemResources.value;
+      throw new Error('No system resource data');
+    }
     const r = res[0];
     const out = {
       cpuLoad: r['cpu-load'] || '0%',

@@ -14,11 +14,44 @@ function isJsonLoggingEnabled() {
   return process.env.NODE_ENV === "production";
 }
 
+export function serializeMetaValue(value: unknown): unknown {
+  if (value instanceof Error) {
+    return { name: value.name, message: value.message, stack: value.stack };
+  }
+  return value;
+}
+
+/**
+ * Winston drops extra log arguments (e.g. `logger.error("failed", err)`) because they
+ * live under a splat symbol that format.json() ignores, and Error properties are
+ * non-enumerable. This format lifts them into an explicit `meta` field so error
+ * details survive in console, file, JSON, and DB transports.
+ */
+const captureMeta = winston.format((info) => {
+  const splat = (info as Record<PropertyKey, unknown>)[Symbol.for("splat")];
+  if (Array.isArray(splat) && splat.length > 0) {
+    const serialized = splat.map(serializeMetaValue);
+    const existing = (info as Record<string, unknown>).meta;
+    const merged = serialized.length === 1 ? serialized[0] : serialized;
+    (info as Record<string, unknown>).meta = existing ? [existing, merged].flat() : merged;
+  }
+  return info;
+});
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "[unserializable meta]";
+  }
+}
+
 function baseFormat() {
   if (isJsonLoggingEnabled()) {
     return winston.format.combine(
       winston.format.timestamp(),
       winston.format.errors({ stack: true }),
+      captureMeta(),
       winston.format.json()
     );
   }
@@ -26,9 +59,14 @@ function baseFormat() {
   return winston.format.combine(
     winston.format.colorize(),
     winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    captureMeta(),
     winston.format.printf((info) => {
       const msg = info.message ?? "";
-      return `${info.timestamp} ${info.level}: ${msg}`;
+      const meta = (info as Record<string, unknown>).meta;
+      const metaStr = meta !== undefined ? ` ${safeStringify(meta)}` : "";
+      const stackStr = info.stack ? `\n${info.stack}` : "";
+      return `${info.timestamp} ${info.level}: ${msg}${metaStr}${stackStr}`;
     })
   );
 }

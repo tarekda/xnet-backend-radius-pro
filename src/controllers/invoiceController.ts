@@ -964,8 +964,7 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
     // Fire-and-forget WhatsApp notification
     ;(async () => {
       try {
-        //invoice.phoneNumber
-        const phone = '+9613974338';
+        const phone = String(invoice.phoneNumber || '').trim();
         if (!phone) {
           console.warn('External invoice has no phone number; skipping WhatsApp', { invoiceId: invoice.id, username: invoice.username });
           return;

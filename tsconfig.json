@@ -12,5 +12,5 @@
     "strictPropertyInitialization": false,
   },
   "include": ["src/**/*", "src/server.ts","types/**/*"],
-  "exclude": ["outputEntities/**/*"],
+  "exclude": ["outputEntities/**/*", "src/**/__tests__/**"],
 }
