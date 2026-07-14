@@ -190,12 +190,25 @@ export async function getAnalyticsMetrics() {
 
   const activeUsers = Number(activeRow?.cnt ?? onlineRow?.cnt ?? 0);
 
+  const distinctUsers = async (start: Date, end: Date) => {
+    const row = await clRepo
+      .createQueryBuilder("cl")
+      .select("COUNT(DISTINCT cl.username)", "cnt")
+      .where("cl.timestamp >= :start", { start })
+      .andWhere("cl.timestamp < :end", { end })
+      .andWhere("cl.status = 'accepted'")
+      .getRawOne<{ cnt: string }>();
+    return Number(row?.cnt ?? 0);
+  };
+  const usersCurr = await distinctUsers(windowStart, new Date(now));
+  const usersPrev = await distinctUsers(prevStart, prevEnd);
+
   return {
     activeUsers,
     bandwidthUsage: `${bwGb.toFixed(2)} GB/day`,
     authSuccessRate: Math.round(authSuccessRate * 10) / 10,
     failedAttempts: current.rejected,
-    userGrowth: 0,
+    userGrowth: Math.round(growthPct(usersCurr, usersPrev) * 10) / 10,
     bandwidthGrowth: Math.round(growthPct(bwCurrBytes, bwPrevBytes) * 10) / 10,
     authRateGrowth: Math.round(growthPct(authSuccessRate, prevAuthRate) * 10) / 10,
     failedAttemptsGrowth: Math.round(growthPct(current.rejected, previous.rejected) * 10) / 10,

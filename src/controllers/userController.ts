@@ -26,6 +26,7 @@ import { Nas } from '../db/entities/Nas';
 import { parseDateOnlyField, sqlMonthlyCycleResetAt, sqlMonthlyCycleStart } from '../utils/quotaCycle';
 import { getQuotaUsageForUsers } from '../utils/quotaUsage';
 import { readOnlineSessionConfig, sqlRadacctIsOnline, sqlRadacctLastUpdate } from '../utils/onlineSessionPolicy';
+import { Brackets } from 'typeorm';
 
 
 
@@ -242,8 +243,9 @@ async function getFreshUsersStatusMap(
 function formatMikrotikRateLimitKbps(speedDown: number | null | undefined, speedUp: number | null | undefined): string {
     const down = typeof speedDown === "number" && Number.isFinite(speedDown) && speedDown > 0 ? Math.floor(speedDown) : 0;
     const up = typeof speedUp === "number" && Number.isFinite(speedUp) && speedUp > 0 ? Math.floor(speedUp) : 0;
-    // Keep the same order as the MikroTik queue you reported: "download/upload"
-    return `${down}k/${up}k`;
+    // max-limit = plan speeds; rate-min (limit-at / CIR) = 0/0 so queues do not guarantee full plan.
+    // Format: rx/tx burst threshold time priority rate-min
+    return `${down}k/${up}k 0/0 0/0 0/0 8 0/0`;
 }
 
 async function getActiveRadiusSession(username: string): Promise<{
@@ -333,17 +335,27 @@ export const UserController = {
             if (page < 1) page = 1;
             if (limit < 1) limit = 10;
             const offset = (page - 1) * limit;
+            const accountStatusFilter = String(req.query.accountStatus ?? "").trim().toLowerCase();
+            const onlineParam = String(req.query.online ?? "").trim().toLowerCase();
+            const onlineFilter =
+                onlineParam === "true" || onlineParam === "1"
+                    ? true
+                    : onlineParam === "false" || onlineParam === "0"
+                      ? false
+                      : null;
 
             const scope = isReseller ? `reseller_${resellerId}` : "global";
-            const cacheKey = `users_page_${scope}_${page}_limit_${limit}`;
-            const statusCacheKey = `users_status_${scope}_${page}_limit_${limit}`;
+            const filterKey = `account_${accountStatusFilter || "all"}_online_${onlineFilter === null ? "all" : onlineFilter ? "yes" : "no"}`;
+            const cacheKey = `users_page_${scope}_${page}_limit_${limit}_${filterKey}`;
+            const statusCacheKey = `users_status_${scope}_${page}_limit_${limit}_${filterKey}`;
 
             // Keep "online" consistent with OnlineUsers:
             // treat sessions as online only if we saw a recent radacct update.
             const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
 
             // 🔹 Check Redis cache for user data
-            const cachedResponse = await redisClient.get(cacheKey);
+            // Online membership changes frequently; never serve a cached filtered membership list.
+            const cachedResponse = onlineFilter === null ? await redisClient.get(cacheKey) : null;
 
             // If the user list is cached, still refresh the status from DB so UI stays in sync.
             if (cachedResponse) {
@@ -374,6 +386,24 @@ export const UserController = {
             // 🔹 Count total users for pagination
             const totalUsersQb = userRepository.createQueryBuilder("user");
             if (isReseller) totalUsersQb.andWhere("user.ownerResellerId = :rid", { rid: resellerId });
+            if (accountStatusFilter) {
+                totalUsersQb.andWhere("LOWER(COALESCE(user.accountStatus, '')) = :accountStatusFilter", {
+                    accountStatusFilter,
+                });
+            }
+            if (onlineFilter !== null) {
+                const onlineExists = `EXISTS (
+                    SELECT 1
+                    FROM session_tracking stf
+                    INNER JOIN radacct raf
+                      ON raf.acctsessionid = stf.session_id
+                     AND ${sqlRadacctIsOnline("raf")}
+                    WHERE stf.username = user.username
+                      AND stf.status = 'active'
+                )`;
+                totalUsersQb.andWhere(onlineFilter ? onlineExists : `NOT ${onlineExists}`);
+                totalUsersQb.setParameters({ staleCutoff, activeCutoff });
+            }
             const totalUsers = await totalUsersQb.getCount();
 
             // 🔹 Fetch users with profile relation and left join UserMac
@@ -476,15 +506,23 @@ export const UserController = {
             if (isReseller) {
                 qb.andWhere("user.ownerResellerId = :rid", { rid: resellerId });
             }
+            if (accountStatusFilter) {
+                qb.andWhere("LOWER(COALESCE(user.accountStatus, '')) = :accountStatusFilter", {
+                    accountStatusFilter,
+                });
+            }
+            if (onlineFilter !== null) {
+                qb.andWhere(
+                    onlineFilter
+                        ? "COALESCE(activeSess.is_online, 0) = 1"
+                        : "COALESCE(activeSess.is_online, 0) = 0"
+                );
+            }
 
             const { entities, raw } = await qb.getRawAndEntities();
 
             const users = formatUsersWithStatus(entities, raw);
             const usersWithQuota = await withQuotaExceededFlags(users);
-
-            if (usersWithQuota.length === 0) {
-                return sendResponse(res, true, 200, "No users found", []);
-            }
 
             // Create a status map for caching
             const statusMap = users.reduce((acc: any, user: any) => {
@@ -502,7 +540,9 @@ export const UserController = {
             };
 
             // Cache user data for 1 hour
-            await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 });
+            if (onlineFilter === null) {
+                await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 });
+            }
             
             // Cache status data for only 30 seconds
             await redisClient.set(statusCacheKey, JSON.stringify(statusMap), { EX: 30 });
@@ -1350,6 +1390,14 @@ export const UserController = {
         try {
             const { query } = req.query;
             const { isReseller, resellerId } = getResellerFilter(req);
+            const accountStatusFilter = String(req.query.accountStatus ?? "").trim().toLowerCase();
+            const onlineParam = String(req.query.online ?? "").trim().toLowerCase();
+            const onlineFilter =
+                onlineParam === "true" || onlineParam === "1"
+                    ? true
+                    : onlineParam === "false" || onlineParam === "0"
+                      ? false
+                      : null;
 
             console.log('Received search query:', query);
 
@@ -1422,12 +1470,29 @@ export const UserController = {
                     "COALESCE(activeSess.last_online_ping, lastActive.last_time_active)",
                     "lastTimeActive"
                 )
-                .where("user.username LIKE :query", { query: `%${query}%` })
-                .orWhere("userDetails.email LIKE :query", { query: `%${query}%` })
-                .orWhere("userDetails.fullName LIKE :query", { query: `%${query}%` })
+                .where(
+                    new Brackets((searchQb) => {
+                        searchQb
+                            .where("user.username LIKE :query", { query: `%${query}%` })
+                            .orWhere("userDetails.email LIKE :query", { query: `%${query}%` })
+                            .orWhere("userDetails.fullName LIKE :query", { query: `%${query}%` });
+                    })
+                )
             
             // Apply reseller scoping (this will become (A OR B OR C) AND owner_reseller_id = rid)
             if (isReseller) qb.andWhere("user.ownerResellerId = :rid", { rid: resellerId });
+            if (accountStatusFilter) {
+                qb.andWhere("LOWER(COALESCE(user.accountStatus, '')) = :accountStatusFilter", {
+                    accountStatusFilter,
+                });
+            }
+            if (onlineFilter !== null) {
+                qb.andWhere(
+                    onlineFilter
+                        ? "COALESCE(activeSess.is_online, 0) = 1"
+                        : "COALESCE(activeSess.is_online, 0) = 0"
+                );
+            }
 
             const { entities, raw } = await qb
                 .select([
@@ -1462,10 +1527,6 @@ export const UserController = {
 
             const users = formatUsersWithStatus(entities, raw);
             const usersWithQuota = await withQuotaExceededFlags(users);
-
-            if (usersWithQuota.length === 0) {
-                return sendResponse(res, true, 200, "No users found", []);
-            }
 
             const responseData = {
                 totalUsers: usersWithQuota.length,

@@ -85,13 +85,42 @@ export async function createWhishPaymentClaim(input: CreateWhishClaimInput) {
 export async function listWhishPaymentClaims(opts?: {
   status?: "pending" | "confirmed" | "rejected";
   limit?: number;
+  reference?: string;
 }) {
   const repo = AppDataSource.getRepository(WhishPaymentClaim);
+  const ref = String(opts?.reference || "").trim();
+  if (ref) {
+    const qb = repo
+      .createQueryBuilder("c")
+      .orderBy("c.created_at", "DESC")
+      .take(Math.min(50, Math.max(1, opts?.limit || 20)));
+    if (opts?.status) {
+      qb.andWhere("c.status = :status", { status: opts.status });
+    }
+    // Exact match first, then prefix/contains for paste typos
+    qb.andWhere(
+      "(c.whish_reference = :exact OR c.whish_reference LIKE :contains)",
+      { exact: ref, contains: `%${ref}%` }
+    );
+    return qb.getMany();
+  }
   const where = opts?.status ? { status: Equal(opts.status) as any } : {};
   return repo.find({
     where,
     order: { createdAt: "DESC" } as any,
     take: Math.min(200, Math.max(1, opts?.limit || 50)),
+  });
+}
+
+/** Lookup claims by Whish reference (for staff paste auto-match). */
+export async function findClaimsByReference(
+  reference: string,
+  opts?: { status?: "pending" | "confirmed" | "rejected"; limit?: number }
+) {
+  return listWhishPaymentClaims({
+    reference,
+    status: opts?.status,
+    limit: opts?.limit ?? 20,
   });
 }
 

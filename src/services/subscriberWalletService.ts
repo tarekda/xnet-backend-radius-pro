@@ -21,6 +21,64 @@ export async function getWalletBalance(username: string, manager?: EntityManager
   return roundMoney(Number(rows?.balance ?? 0));
 }
 
+/** Sum of wallet debits already applied toward an external invoice (full + partial). */
+export async function getWalletPaidTowardInvoice(
+  invoiceId: number,
+  manager?: EntityManager
+): Promise<number> {
+  const repo = (manager ?? AppDataSource).getRepository(SubscriberWalletEntry);
+  const id = String(invoiceId);
+  const rows = await repo
+    .createQueryBuilder("e")
+    .select("COALESCE(SUM(e.amount), 0)", "paid")
+    .where("e.entry_type = :type", { type: "debit" })
+    .andWhere("e.reference_type = :rt", { rt: "external_invoice" })
+    .andWhere("(e.reference_id = :id OR e.reference_id LIKE :prefix)", {
+      id,
+      prefix: `${id}:p%`,
+    })
+    .getRawOne<{ paid: string }>();
+  return roundMoney(Number(rows?.paid ?? 0));
+}
+
+export async function listWalletLedger(opts: {
+  username?: string;
+  entryType?: "credit" | "debit";
+  page?: number;
+  limit?: number;
+}) {
+  const page = Math.max(1, opts.page || 1);
+  const limit = Math.min(100, Math.max(1, opts.limit || 50));
+  const repo = AppDataSource.getRepository(SubscriberWalletEntry);
+  const qb = repo.createQueryBuilder("e").orderBy("e.created_at", "DESC");
+
+  if (opts.username?.trim()) {
+    qb.andWhere("e.username = :username", { username: opts.username.trim() });
+  }
+  if (opts.entryType === "credit" || opts.entryType === "debit") {
+    qb.andWhere("e.entry_type = :entryType", { entryType: opts.entryType });
+  }
+
+  const [entries, total] = await qb
+    .skip((page - 1) * limit)
+    .take(limit)
+    .getManyAndCount();
+
+  let balance: number | null = null;
+  if (opts.username?.trim()) {
+    balance = await getWalletBalance(opts.username.trim());
+  }
+
+  return {
+    data: entries,
+    total,
+    page,
+    limit,
+    totalPages: Math.max(1, Math.ceil(total / limit)),
+    balance,
+  };
+}
+
 export async function findLedgerByReference(
   referenceType: string,
   referenceId: string,
@@ -118,13 +176,16 @@ export async function debitWallet(opts: {
 
 /**
  * Pay an external invoice from subscriber wallet balance.
- * Marks invoice paid with paymentMethod/provider=wallet and paymentReference=WALLET-{ledgerId}.
+ * Supports partial pay when balance < remaining due (or when opts.amount is set).
+ * Marks invoice paid only when cumulative wallet payments cover the full amount.
  */
 export async function payInvoiceFromWallet(opts: {
   externalInvoiceId: number;
   username: string;
   actorUsername?: string;
   renewMonths?: number;
+  /** Optional cap; defaults to min(balance, remaining due). */
+  amount?: number;
 }) {
   return AppDataSource.transaction(async (manager) => {
     const invoiceRepo = manager.getRepository(ExternalInvoice);
@@ -142,48 +203,131 @@ export async function payInvoiceFromWallet(opts: {
         balance,
         renewed: false,
         alreadyPaid: true,
+        partial: false,
+        amountPaid: roundMoney(Number(invoice.totalAmount ?? invoice.amount ?? 0)),
+        remainingDue: 0,
       };
     }
 
-    const amount = roundMoney(Number(invoice.totalAmount ?? invoice.amount ?? 0));
-    if (!Number.isFinite(amount) || amount <= 0) {
+    const due = roundMoney(Number(invoice.totalAmount ?? invoice.amount ?? 0));
+    if (!Number.isFinite(due) || due <= 0) {
       throw Object.assign(new Error("Invoice has no payable amount"), { status: 400 });
     }
 
+    const previouslyPaid = await getWalletPaidTowardInvoice(invoice.id!, manager);
+    const remaining = roundMoney(Math.max(0, due - previouslyPaid));
+    if (remaining <= 0) {
+      const paidAt = new Date();
+      invoice.status = "paid";
+      invoice.paidAt = paidAt;
+      invoice.paymentMethod = "wallet";
+      invoice.paymentProvider = "wallet";
+      invoice.collectedBy = opts.actorUsername || opts.username;
+      invoice.collectedAt = paidAt;
+      invoice.lastAction = `paid_from_wallet (settled prior partials) by ${opts.actorUsername || opts.username}`;
+      invoice.modifiedAt = paidAt;
+      await invoiceRepo.save(invoice);
+      const renew = await renewIfExpired(opts.username, opts.renewMonths ?? 1, manager);
+      const balance = await getWalletBalance(opts.username, manager);
+      return {
+        invoice,
+        balance,
+        renewed: renew.renewed,
+        renew,
+        alreadyPaid: false,
+        partial: false,
+        amountPaid: due,
+        remainingDue: 0,
+      };
+    }
+
+    const balance = await getWalletBalance(opts.username, manager);
+    if (balance + 1e-9 < 0.01) {
+      throw Object.assign(new Error("Wallet balance is empty — top up via Whish first"), {
+        status: 400,
+      });
+    }
+
+    let payAmount = Math.min(remaining, balance);
+    if (opts.amount != null && Number.isFinite(Number(opts.amount))) {
+      const requested = roundMoney(Number(opts.amount));
+      if (requested <= 0) {
+        throw Object.assign(new Error("Payment amount must be positive"), { status: 400 });
+      }
+      payAmount = Math.min(payAmount, requested);
+    }
+    payAmount = roundMoney(payAmount);
+    if (payAmount < 0.01) {
+      throw Object.assign(new Error("Payment amount too small"), { status: 400 });
+    }
+
+    const isPartial = payAmount + 1e-9 < remaining;
+    const referenceId = isPartial || previouslyPaid > 0
+      ? `${invoice.id}:p${Date.now()}`
+      : String(invoice.id);
+
     const debit = await debitWallet({
       username: opts.username,
-      amount,
+      amount: payAmount,
       currency: "USD",
       referenceType: "external_invoice",
-      referenceId: String(invoice.id),
-      note: `Pay invoice #${invoice.id} from wallet`,
+      referenceId,
+      note: isPartial
+        ? `Partial pay invoice #${invoice.id} (${payAmount.toFixed(2)} of ${remaining.toFixed(2)} remaining)`
+        : `Pay invoice #${invoice.id} from wallet`,
       createdBy: opts.actorUsername || opts.username,
       manager,
     });
 
     const paidAt = new Date();
     const walletTxnId = `WALLET-${debit.id}`;
+    const totalPaidToward = roundMoney(previouslyPaid + payAmount);
+    const remainingAfter = roundMoney(Math.max(0, due - totalPaidToward));
+    const fullyPaid = remainingAfter < 0.01;
 
-    invoice.status = "paid";
-    invoice.paidAt = paidAt;
     invoice.paymentMethod = "wallet";
     invoice.paymentProvider = "wallet";
     invoice.paymentReference = walletTxnId;
-    invoice.collectedBy = opts.actorUsername || opts.username;
-    invoice.collectedAt = paidAt;
-    invoice.lastAction = `paid_from_wallet txn=${walletTxnId} at ${paidAt.toISOString()} by ${opts.actorUsername || opts.username}`;
     invoice.modifiedAt = paidAt;
+
+    if (fullyPaid) {
+      invoice.status = "paid";
+      invoice.paidAt = paidAt;
+      invoice.collectedBy = opts.actorUsername || opts.username;
+      invoice.collectedAt = paidAt;
+      invoice.lastAction = `paid_from_wallet txn=${walletTxnId} total=${due.toFixed(2)} at ${paidAt.toISOString()} by ${opts.actorUsername || opts.username}`;
+      await invoiceRepo.save(invoice);
+
+      const renew = await renewIfExpired(opts.username, opts.renewMonths ?? 1, manager);
+      const newBalance = await getWalletBalance(opts.username, manager);
+      return {
+        invoice,
+        balance: newBalance,
+        renewed: renew.renewed,
+        renew,
+        alreadyPaid: false,
+        partial: false,
+        amountApplied: payAmount,
+        amountPaid: due,
+        remainingDue: 0,
+        walletTransactionId: walletTxnId,
+        paidAt,
+      };
+    }
+
+    invoice.lastAction = `partial_wallet_pay txn=${walletTxnId} applied=${payAmount.toFixed(2)} paid=${totalPaidToward.toFixed(2)}/${due.toFixed(2)} remaining=${remainingAfter.toFixed(2)}`;
     await invoiceRepo.save(invoice);
 
-    const renew = await renewIfExpired(opts.username, opts.renewMonths ?? 1, manager);
-    const balance = await getWalletBalance(opts.username, manager);
-
+    const newBalance = await getWalletBalance(opts.username, manager);
     return {
       invoice,
-      balance,
-      renewed: renew.renewed,
-      renew,
+      balance: newBalance,
+      renewed: false,
       alreadyPaid: false,
+      partial: true,
+      amountApplied: payAmount,
+      amountPaid: totalPaidToward,
+      remainingDue: remainingAfter,
       walletTransactionId: walletTxnId,
       paidAt,
     };

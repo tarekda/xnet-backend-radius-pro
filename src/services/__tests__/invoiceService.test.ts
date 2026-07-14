@@ -340,4 +340,24 @@ describe('upsertExternalInvoices', () => {
             expect.objectContaining({ invoiceId: 5, action: 'DELETED', username: 'admin' })
         );
     });
+
+    it('limits stale-row removal to explicitly scoped providers', async () => {
+        const staleMyISP = invoice({ id: 10, username: 'old-myisp', provider: 'myisp' });
+        const keptMyISP = invoice({ id: 11, username: 'current-myisp', provider: 'myisp' });
+        const otherProvider = invoice({ id: 12, username: 'idm-user', provider: 'idm' });
+        const repo = mockRepo([staleMyISP, keptMyISP, otherProvider]);
+
+        const result = await upsertExternalInvoices(
+            [invoice({ username: 'current-myisp', provider: 'myisp' })],
+            {
+                scopedBillingMonths: ['2026-07-01'],
+                scopedProviders: ['myisp'],
+                actorUsername: 'admin',
+            }
+        );
+
+        expect(result.removedFromScope).toBe(1);
+        const removed = repo.softRemove.mock.calls[0][0] as ExternalInvoice[];
+        expect(removed.map((row) => row.id)).toEqual([10]);
+    });
 });

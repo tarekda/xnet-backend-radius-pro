@@ -15,6 +15,7 @@ import {
   subscriberReportWhishPayment,
   subscriberInvoiceClaims,
   subscriberWallet,
+  subscriberWalletLedger,
   subscriberPayFromWallet,
 } from "../controllers/subscriberController";
 
@@ -27,6 +28,7 @@ const apiRouter = Router();
 apiRouter.use(authenticateSubscriber);
 apiRouter.get("/me", subscriberMe);
 apiRouter.get("/wallet", subscriberWallet);
+apiRouter.get("/wallet/ledger", subscriberWalletLedger);
 apiRouter.get("/usage", subscriberUsage);
 apiRouter.get("/sessions", subscriberSessions);
 apiRouter.get("/payment-provider", subscriberPaymentProvider);

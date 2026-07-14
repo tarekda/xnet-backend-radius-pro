@@ -291,16 +291,30 @@ export async function createCreditNote(parentInvoiceId: number, actorUsername: s
   if (!parent) throw new Error("Invoice not found");
   if (parent.documentType === "credit_note") throw new Error("Cannot credit a credit note");
 
-  const amount = -Math.abs(Number(parent.totalAmount ?? parent.amount ?? 0));
+  const existing = await repo.findOne({
+    where: {
+      parentInvoiceId: Equal(parentInvoiceId),
+      documentType: Equal("credit_note") as any,
+    },
+  });
+  if (existing) throw new Error(`Credit note #${existing.id} already exists for this invoice`);
+
+  const totalAmount = -Math.abs(Number(parent.totalAmount ?? parent.amount ?? 0));
+  const subtotalAmount = -Math.abs(
+    Number(parent.subtotalAmount ?? parent.totalAmount ?? parent.amount ?? 0)
+  );
+  const taxAmount = -Math.abs(
+    Number(parent.taxAmount ?? Math.abs(totalAmount) - Math.abs(subtotalAmount))
+  );
   const note = repo.create({
     username: parent.username,
     email: parent.email,
     address: parent.address,
-    amount,
-    subtotalAmount: amount,
-    taxAmount: 0,
+    amount: totalAmount,
+    subtotalAmount,
+    taxAmount,
     taxRate: parent.taxRate ?? 0,
-    totalAmount: amount,
+    totalAmount,
     status: "paid",
     fullName: parent.fullName,
     phoneNumber: parent.phoneNumber,

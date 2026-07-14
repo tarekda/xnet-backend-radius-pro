@@ -4,13 +4,6 @@ import {
   bulkPayInvoices, generateMonthlyInvoices,
   getAllExternalInvoices, getAllInvoices,
   payInvoice, payExternalInvoice,
-  upsertExternalInvoices,
-  enrichExternalInvoicesFromUserDetails,
-  applyDefaultPayDueDates,
-  inheritPayDueDatesFromPrior,
-  inheritCarryoverLinesFromPriorMonth,
-  mergeDuplicateIncomingInvoices,
-  normalizeBillingMonthKey,
   createExternalInvoiceDebit,
   getExternalInvoicePaymentLines,
   updateExternalInvoice,
@@ -43,14 +36,17 @@ import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import { invoiceEvents } from "../events/invoiceEvents";
 import eventBus from "../bus/eventBusSingleton";
 import { AppDataSource } from "../db/config";
-import { IsNull } from "typeorm";
 import { Invoices } from "../db/entities/Invoices";
 import { UserDetails } from "../db/entities/UserDetails";
 import { Raduserprofile } from "../db/entities/Raduserprofile";
 import { composePaidMessage, sendWhatsAppMessage, sendWhatsAppMessageStrict, getWhatsAppConfigStatus, getTwilioCredentialDiagnostics, testTwilioCredentials, composeReminderMessage, buildReminderTemplateVariables, buildPaymentTemplateVariables } from "../services/whatsappService";
 import { createPaymentIntent, getOpenCheckoutUrl } from "../services/paymentGatewayService";
-import { coerceToAppError } from "../errors/AppError";
+import { BadRequestError, coerceToAppError } from "../errors/AppError";
 import { recordDunningRun } from "../metrics/metrics";
+import { importExternalInvoices } from "../services/externalInvoiceImportService";
+import { fetchMyISPInvoices } from "../services/myispInvoiceService";
+import { fetchActiveRadiusInvoices } from "../services/radiusInvoiceImportService";
+import { fetchHsiProviderInvoices, HsiProvider } from "../services/hsiProviderInvoiceService";
 
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
   res.status(status).json({ success, message, data });
@@ -690,55 +686,18 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
       actorUsername: req.user?.username,
     });
 
-    if (skippedCount > 0) {
-      console.log(`Import skipped ${skippedCount} row(s) (missing username or filtered)`);
-    }
-
-    // Merge rows describing the same invoice (same username + full name + month + provider + line)
-    const { invoices: filteredInvoices, merged: mergedDuplicates } = mergeDuplicateIncomingInvoices(parsedInvoices);
-    if (mergedDuplicates > 0) {
-      console.log(`Import merged ${mergedDuplicates} duplicate row(s) into existing records`);
-    }
-
-    const enrichedFromUserDetails = await enrichExternalInvoicesFromUserDetails(filteredInvoices);
-
-    const repo = AppDataSource.getRepository(ExternalInvoice);
-    const currentRows = await repo.find({ where: { deletedAt: IsNull() } });
-
-    const { invoices: withCarryover, added: inheritedCarryoverLines } = inheritCarryoverLinesFromPriorMonth(
-      filteredInvoices,
-      currentRows
-    );
-
-    const inheritedPayDueDates = inheritPayDueDatesFromPrior(withCarryover, currentRows, {
-      overrideIncoming: true,
-    });
-
-    const payDueDayOffsetRaw = req.body?.payDueDayOffset;
-    if (payDueDayOffsetRaw !== undefined && payDueDayOffsetRaw !== null && String(payDueDayOffsetRaw).trim() !== '') {
-      const payDueDayOffset = parseInt(String(payDueDayOffsetRaw), 10);
-      if (Number.isFinite(payDueDayOffset) && payDueDayOffset >= 0) {
-        applyDefaultPayDueDates(withCarryover, payDueDayOffset);
-      }
-    }
-
-    const scopedBillingMonths = monthOverride
-      ? [monthOverride]
-      : [...new Set(withCarryover.map((i) => normalizeBillingMonthKey(i.billingMonth as string)))];
-
-    const upsertResult = await upsertExternalInvoices(withCarryover, {
-      scopedBillingMonths,
+    const result = await importExternalInvoices({
+      invoices: parsedInvoices,
+      skippedCount,
+      monthOverride,
+      payDueDayOffset: req.body?.payDueDayOffset,
       actorUsername: req.user?.username,
     });
-    upsertResult.enrichedFromUserDetails = enrichedFromUserDetails;
-    upsertResult.inheritedPayDueDates = inheritedPayDueDates;
-    upsertResult.inheritedCarryoverLines = inheritedCarryoverLines;
-    upsertResult.mergedDuplicates = mergedDuplicates;
     cleanupImportFile(filePath);
     res.status(200).json({
       success: true,
       message: 'Invoices uploaded successfully',
-      data: { ...upsertResult, skippedRows: skippedCount },
+      data: result,
     });
   } catch (err) {
     console.error('Upload error:', err);
@@ -746,6 +705,166 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
     res.status(500).json({ success: false, message: 'Failed to upload invoice file' });
   }
 };
+
+function requireBillingMonth(value: unknown): string {
+  const raw = String(value ?? '').trim();
+  if (!/^\d{4}-(0[1-9]|1[0-2])(?:-01)?$/.test(raw)) {
+    throw new BadRequestError('billingMonth must be in YYYY-MM format');
+  }
+  const normalized = normalizeToMonthStart(raw);
+  if (!normalized) throw new BadRequestError('Invalid billingMonth');
+  return normalized;
+}
+
+export const previewMyISPInvoicesHandler = async (req: Request, res: Response) => {
+  try {
+    const billingMonth = requireBillingMonth(req.body?.billingMonth);
+    const { preview } = await fetchMyISPInvoices(
+      billingMonth,
+      req.user?.username
+    );
+    return sendResponse(res, true, 200, 'MyISP invoice preview generated', preview);
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to preview MyISP invoices');
+  }
+};
+
+export const importMyISPInvoicesHandler = async (req: Request, res: Response) => {
+  try {
+    const billingMonth = requireBillingMonth(req.body?.billingMonth);
+    const { invoices, preview } = await fetchMyISPInvoices(
+      billingMonth,
+      req.user?.username
+    );
+    const result = await importExternalInvoices({
+      invoices,
+      skippedCount: preview.skippedRowCount,
+      monthOverride: billingMonth,
+      scopedProviders: ['myisp'],
+      payDueDayOffset: req.body?.payDueDayOffset,
+      actorUsername: req.user?.username,
+    });
+    return sendResponse(res, true, 200, 'MyISP invoices imported successfully', result);
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to import MyISP invoices');
+  }
+};
+
+export const previewMyISP2InvoicesHandler = async (req: Request, res: Response) => {
+  try {
+    const billingMonth = requireBillingMonth(req.body?.billingMonth);
+    const { preview } = await fetchMyISPInvoices(
+      billingMonth,
+      req.user?.username,
+      2
+    );
+    return sendResponse(res, true, 200, 'MyISP account 2 invoice preview generated', preview);
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to preview MyISP account 2 invoices');
+  }
+};
+
+export const importMyISP2InvoicesHandler = async (req: Request, res: Response) => {
+  try {
+    const billingMonth = requireBillingMonth(req.body?.billingMonth);
+    const { invoices, preview } = await fetchMyISPInvoices(
+      billingMonth,
+      req.user?.username,
+      2
+    );
+    const result = await importExternalInvoices({
+      invoices,
+      skippedCount: preview.skippedRowCount,
+      monthOverride: billingMonth,
+      scopedProviders: ['myisp2'],
+      payDueDayOffset: req.body?.payDueDayOffset,
+      actorUsername: req.user?.username,
+    });
+    return sendResponse(res, true, 200, 'MyISP account 2 invoices imported successfully', result);
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to import MyISP account 2 invoices');
+  }
+};
+
+export const previewRadiusInvoicesHandler = async (req: Request, res: Response) => {
+  try {
+    const billingMonth = requireBillingMonth(req.body?.billingMonth);
+    const { preview } = await fetchActiveRadiusInvoices(
+      billingMonth,
+      req.user?.username
+    );
+    return sendResponse(res, true, 200, 'Active RADIUS invoice preview generated', preview);
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to preview active RADIUS invoices');
+  }
+};
+
+export const importRadiusInvoicesHandler = async (req: Request, res: Response) => {
+  try {
+    const billingMonth = requireBillingMonth(req.body?.billingMonth);
+    const { invoices, preview } = await fetchActiveRadiusInvoices(
+      billingMonth,
+      req.user?.username
+    );
+    const result = await importExternalInvoices({
+      invoices,
+      skippedCount: preview.skippedRowCount,
+      monthOverride: billingMonth,
+      scopedProviders: ['radius'],
+      payDueDayOffset: req.body?.payDueDayOffset,
+      overrideIncomingPayDueDates: false,
+      actorUsername: req.user?.username,
+    });
+    return sendResponse(res, true, 200, 'Active RADIUS invoices imported successfully', result);
+  } catch (error) {
+    return sendCaughtError(res, error, 'Failed to import active RADIUS invoices');
+  }
+};
+
+async function previewHsiProvider(provider: HsiProvider, req: Request, res: Response) {
+  try {
+    const billingMonth = requireBillingMonth(req.body?.billingMonth);
+    const { preview } = await fetchHsiProviderInvoices(
+      provider,
+      billingMonth,
+      req.user?.username
+    );
+    return sendResponse(res, true, 200, `${provider.toUpperCase()} invoice preview generated`, preview);
+  } catch (error) {
+    return sendCaughtError(res, error, `Failed to preview ${provider.toUpperCase()} invoices`);
+  }
+}
+
+async function importHsiProvider(provider: HsiProvider, req: Request, res: Response) {
+  try {
+    const billingMonth = requireBillingMonth(req.body?.billingMonth);
+    const { invoices, preview } = await fetchHsiProviderInvoices(
+      provider,
+      billingMonth,
+      req.user?.username
+    );
+    const result = await importExternalInvoices({
+      invoices,
+      skippedCount: preview.skippedRowCount,
+      monthOverride: billingMonth,
+      scopedProviders: [provider],
+      payDueDayOffset: req.body?.payDueDayOffset,
+      actorUsername: req.user?.username,
+    });
+    return sendResponse(res, true, 200, `${provider.toUpperCase()} invoices imported successfully`, result);
+  } catch (error) {
+    return sendCaughtError(res, error, `Failed to import ${provider.toUpperCase()} invoices`);
+  }
+}
+
+export const previewIDMInvoicesHandler = (req: Request, res: Response) =>
+  previewHsiProvider('idm', req, res);
+export const importIDMInvoicesHandler = (req: Request, res: Response) =>
+  importHsiProvider('idm', req, res);
+export const previewTerraInvoicesHandler = (req: Request, res: Response) =>
+  previewHsiProvider('terra', req, res);
+export const importTerraInvoicesHandler = (req: Request, res: Response) =>
+  importHsiProvider('terra', req, res);
 
 // ... existing code ...
 

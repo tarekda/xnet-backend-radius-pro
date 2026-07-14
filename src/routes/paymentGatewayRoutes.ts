@@ -14,6 +14,20 @@ import {
   listWhishPaymentClaims,
   rejectWhishPaymentClaim,
 } from "../services/whishPaymentClaimService";
+import {
+  adminCreditWallet,
+  getWalletBalance,
+  listWalletLedger,
+} from "../services/subscriberWalletService";
+import {
+  buildPaymentTemplateVariables,
+  composeWalletCreditMessage,
+  sendWhatsAppMessage,
+} from "../services/whatsappService";
+import { AppDataSource } from "../db/config";
+import { ExternalInvoice } from "../db/entities/ExternalInvoice";
+import { UserDetails } from "../db/entities/UserDetails";
+import { Equal } from "typeorm";
 
 const router = Router();
 
@@ -32,13 +46,68 @@ router.get(
   authorizeAnyPermissions("billing.externalInvoices.pay", "billing.externalInvoices.view"),
   async (req: Request, res: Response) => {
     try {
-      const status = String(req.query.status || "pending") as "pending" | "confirmed" | "rejected";
+      const statusRaw = String(req.query.status || "pending");
+      const status = ["pending", "confirmed", "rejected"].includes(statusRaw)
+        ? (statusRaw as "pending" | "confirmed" | "rejected")
+        : "pending";
+      const reference = req.query.reference ? String(req.query.reference).trim() : undefined;
       const claims = await listWhishPaymentClaims({
-        status: ["pending", "confirmed", "rejected"].includes(status) ? status : "pending",
+        status: reference ? (req.query.status ? status : undefined) : status,
+        reference,
+        limit: reference ? 20 : 50,
       });
       res.status(200).json({ success: true, data: claims });
     } catch (e: any) {
       res.status(400).json({ success: false, message: e?.message || "Failed to list claims" });
+    }
+  }
+);
+
+router.get(
+  "/subscriber-wallet/ledger",
+  authenticateToken,
+  authorizeAnyPermissions("billing.externalInvoices.pay", "billing.externalInvoices.view"),
+  async (req: Request, res: Response) => {
+    try {
+      const username = req.query.username ? String(req.query.username).trim() : undefined;
+      const entryTypeRaw = String(req.query.entryType || "").toLowerCase();
+      const entryType =
+        entryTypeRaw === "credit" || entryTypeRaw === "debit" ? entryTypeRaw : undefined;
+      const page = parseInt(String(req.query.page || "1"), 10);
+      const limit = parseInt(String(req.query.limit || "50"), 10);
+      const result = await listWalletLedger({ username, entryType, page, limit });
+      res.status(200).json({ success: true, ...result });
+    } catch (e: any) {
+      res.status(400).json({ success: false, message: e?.message || "Failed to list wallet ledger" });
+    }
+  }
+);
+
+router.post(
+  "/subscriber-wallet/credit",
+  authenticateToken,
+  authorizeAnyPermissions("billing.externalInvoices.pay"),
+  async (req: Request, res: Response) => {
+    try {
+      const username = String(req.body?.username || "").trim();
+      const amount = Number(req.body?.amount);
+      const note = req.body?.note ? String(req.body.note) : undefined;
+      const actor = (req.user as any)?.username || "system";
+      if (!username) {
+        res.status(400).json({ success: false, message: "username is required" });
+        return;
+      }
+      const entry = await adminCreditWallet({
+        username,
+        amount,
+        note,
+        createdBy: actor,
+      });
+      const balance = await getWalletBalance(username);
+      res.status(201).json({ success: true, data: { entry, balance } });
+    } catch (e: any) {
+      const status = e?.status && Number.isFinite(e.status) ? e.status : 400;
+      res.status(status).json({ success: false, message: e?.message || "Failed to credit wallet" });
     }
   }
 );
@@ -56,6 +125,55 @@ router.post(
         amount: req.body?.amount != null ? Number(req.body.amount) : undefined,
       });
       res.status(200).json({ success: true, data: result });
+
+      // Fire-and-forget: notify subscriber that wallet was credited
+      if (result.walletCredited) {
+        ;(async () => {
+          try {
+            const claim = result.claim;
+            let phone = String(result.invoice?.phoneNumber || "").trim();
+            let fullName = result.invoice?.fullName || null;
+            if (!phone) {
+              const details = await AppDataSource.getRepository(UserDetails).findOne({
+                where: { username: Equal(claim.username) },
+              });
+              phone = String(details?.phoneNumber || "").trim();
+              fullName = fullName || details?.fullName || null;
+            }
+            if (!phone && result.invoice == null) {
+              const inv = await AppDataSource.getRepository(ExternalInvoice).findOne({
+                where: { id: Equal(claim.externalInvoiceId) },
+              });
+              phone = String(inv?.phoneNumber || "").trim();
+              fullName = fullName || inv?.fullName || null;
+            }
+            if (!phone) {
+              console.warn("No phone for wallet-credit WhatsApp", { username: claim.username });
+              return;
+            }
+            const message = composeWalletCreditMessage({
+              fullName,
+              username: claim.username,
+              amount: claim.amount,
+              balance: result.balance,
+              invoiceId: claim.externalInvoiceId,
+            });
+            await sendWhatsAppMessage({
+              to: phone,
+              message,
+              templateKind: "payment",
+              templateVariables: buildPaymentTemplateVariables({
+                fullName,
+                username: claim.username,
+                invoiceId: claim.externalInvoiceId,
+                amount: claim.amount,
+              }),
+            });
+          } catch (err) {
+            console.warn("Failed to send wallet-credit WhatsApp", err);
+          }
+        })();
+      }
     } catch (e: any) {
       const status = e?.status && Number.isFinite(e.status) ? e.status : 400;
       res.status(status).json({ success: false, message: e?.message || "Failed to confirm claim" });

@@ -102,14 +102,14 @@ export function buildPaymentTemplateVariables(params: {
  * Sends a WhatsApp text message via Meta WhatsApp Cloud API or Twilio.
  * Requires WHATSAPP_ENABLED=true and provider-specific env vars.
  */
-export async function sendWhatsAppMessage({ to, message, templateVariables }: WhatsAppSendOptions): Promise<void> {
+export async function sendWhatsAppMessage({ to, message, templateVariables, templateKind, contentSid }: WhatsAppSendOptions): Promise<void> {
     if (process.env.WHATSAPP_ENABLED !== 'true') {
         return; // disabled in this environment
     }
 
     const provider = (process.env.WHATSAPP_PROVIDER || 'cloud').toLowerCase();
     if (provider === 'twilio') {
-        return sendViaTwilio({ to, message, templateVariables });
+        return sendViaTwilio({ to, message, templateVariables, templateKind, contentSid });
     }
 
     return sendViaCloud({ to, message });
@@ -650,6 +650,25 @@ export function composePaidMessage(params: {
     const amountStr = typeof params.amount === 'number' ? params.amount.toFixed(2) : undefined;
     const invoiceRef = params.invoiceId ? ` (Invoice #${params.invoiceId})` : "";
     return `Hi ${name}, your payment${invoiceRef} has been received${amountStr ? `: $${amountStr}` : ''}. Thank you!`;
+}
+
+/** Notify subscriber that Whish was approved and wallet was credited. */
+export function composeWalletCreditMessage(params: {
+    fullName?: string | null;
+    username?: string;
+    amount?: number;
+    balance?: number;
+    invoiceId?: number;
+}): string {
+    const name = params.fullName || params.username || "Customer";
+    const amountStr = typeof params.amount === "number" ? params.amount.toFixed(2) : "0.00";
+    const balStr = typeof params.balance === "number" ? params.balance.toFixed(2) : null;
+    const inv = params.invoiceId ? ` (for invoice #${params.invoiceId})` : "";
+    return (
+        `Hi ${name}, $${amountStr} was credited to your wallet${inv}.` +
+        (balStr != null ? ` Current balance: $${balStr}.` : "") +
+        ` Open the subscriber portal and tap Pay from wallet to settle your invoice.`
+    );
 }
 
 

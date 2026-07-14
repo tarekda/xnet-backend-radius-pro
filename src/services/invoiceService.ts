@@ -10,6 +10,62 @@ import { ModificationLog } from '../db/entities/ModificationLog';
 import { invoiceEvents } from '../events/invoiceEvents';
 import { recordInvoicePayment } from '../metrics/metrics';
 
+/** Default VAT/tax rate for new invoices (e.g. 0.11 = 11%). 0 = tax inclusive amount only. */
+function defaultInvoiceTaxRate(): number {
+    const raw = Number(process.env.INVOICE_TAX_RATE ?? process.env.DEFAULT_TAX_RATE ?? 0);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 0;
+}
+
+function roundMoney2(n: number): number {
+    return Math.round(n * 100) / 100;
+}
+
+/**
+ * Apply tax breakdown. By default `amount` is treated as the total (tax-inclusive)
+ * when INVOICE_TAX_INCLUSIVE=1 (default), or as subtotal when inclusive=0.
+ */
+export function applyInvoiceTaxFields(
+    amount: number,
+    opts?: { taxRate?: number | null; taxInclusive?: boolean }
+): {
+    amount: number;
+    subtotalAmount: number;
+    taxRate: number;
+    taxAmount: number;
+    totalAmount: number;
+} {
+    const taxRate = opts?.taxRate != null && Number.isFinite(Number(opts.taxRate))
+        ? Number(opts.taxRate)
+        : defaultInvoiceTaxRate();
+    const inclusive =
+        opts?.taxInclusive !== undefined
+            ? opts.taxInclusive
+            : String(process.env.INVOICE_TAX_INCLUSIVE ?? "1") !== "0";
+    const base = roundMoney2(Number(amount) || 0);
+
+    if (taxRate <= 0) {
+        return {
+            amount: base,
+            subtotalAmount: base,
+            taxRate: 0,
+            taxAmount: 0,
+            totalAmount: base,
+        };
+    }
+
+    if (inclusive) {
+        const totalAmount = base;
+        const subtotalAmount = roundMoney2(totalAmount / (1 + taxRate));
+        const taxAmount = roundMoney2(totalAmount - subtotalAmount);
+        return { amount: totalAmount, subtotalAmount, taxRate, taxAmount, totalAmount };
+    }
+
+    const subtotalAmount = base;
+    const taxAmount = roundMoney2(subtotalAmount * taxRate);
+    const totalAmount = roundMoney2(subtotalAmount + taxAmount);
+    return { amount: totalAmount, subtotalAmount, taxRate, taxAmount, totalAmount };
+}
+
 function isYmdOnly(value: string): boolean {
     return /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
@@ -780,6 +836,17 @@ function mergeIncomingExternalInvoice(
         merged.collectedAt = existing.collectedAt;
     }
 
+    if (incoming.amount != null && Number.isFinite(Number(incoming.amount))) {
+        const tax = applyInvoiceTaxFields(Number(incoming.amount), {
+            taxRate: (incoming as any).taxRate ?? existing.taxRate,
+        });
+        merged.amount = tax.amount;
+        merged.subtotalAmount = tax.subtotalAmount;
+        merged.taxRate = tax.taxRate;
+        merged.taxAmount = tax.taxAmount;
+        merged.totalAmount = tax.totalAmount;
+    }
+
     return merged;
 }
 
@@ -845,7 +912,7 @@ export function applyDefaultPayDueDates(
 /** Upsert by username + billingMonth + provider; optionally soft-delete stale rows for imported billing months. */
 export const upsertExternalInvoices = async (
     incoming: Partial<ExternalInvoice>[],
-    options?: { scopedBillingMonths?: string[]; actorUsername?: string }
+    options?: { scopedBillingMonths?: string[]; scopedProviders?: string[]; actorUsername?: string }
 ): Promise<UpsertExternalInvoicesResult> => {
     const repo = AppDataSource.getRepository(ExternalInvoice);
     const current = await repo.find({ where: { deletedAt: IsNull() } });
@@ -870,7 +937,13 @@ export const upsertExternalInvoices = async (
         // fold the later row into the queued record instead of inserting a duplicate.
         const queued = queuedByKey.get(key);
         if (queued) {
-            queued.amount = Number(queued.amount ?? 0) + Number(item.amount ?? 0);
+            const summed = Number(queued.amount ?? 0) + Number(item.amount ?? 0);
+            const tax = applyInvoiceTaxFields(summed, { taxRate: (queued as any).taxRate });
+            queued.amount = tax.amount;
+            queued.subtotalAmount = tax.subtotalAmount;
+            queued.taxRate = tax.taxRate;
+            queued.taxAmount = tax.taxAmount;
+            queued.totalAmount = tax.totalAmount;
             queued.payDueDate = latestDateString(queued.payDueDate, item.payDueDate as string | null);
             continue;
         }
@@ -883,6 +956,9 @@ export const upsertExternalInvoices = async (
             record = mergeIncomingExternalInvoice(existing, item);
             updated++;
         } else {
+            const tax = applyInvoiceTaxFields(Number(item.amount ?? 0), {
+                taxRate: (item as any).taxRate,
+            });
             record = {
                 ...(item as ExternalInvoice),
                 billingMonth: normalizeBillingMonthKey(item.billingMonth as string),
@@ -890,6 +966,12 @@ export const upsertExternalInvoices = async (
                 phoneNumber: item.phoneNumber || '',
                 debitLabel: normalizeDebitLabel((item as ExternalInvoice).debitLabel) || '',
                 lastAction: item.lastAction || 'IMPORT_INSERT',
+                amount: tax.amount,
+                subtotalAmount: tax.subtotalAmount,
+                taxRate: tax.taxRate,
+                taxAmount: tax.taxAmount,
+                totalAmount: tax.totalAmount,
+                documentType: (item as any).documentType || 'invoice',
             };
             inserted++;
         }
@@ -903,11 +985,17 @@ export const upsertExternalInvoices = async (
 
     let removedFromScope = 0;
     const scopedMonths = (options?.scopedBillingMonths ?? []).map((m) => normalizeBillingMonthKey(m));
+    const scopedProviders = (options?.scopedProviders ?? [])
+        .map((provider) => String(provider).trim().toLowerCase())
+        .filter(Boolean);
     if (scopedMonths.length > 0) {
         const actor = options?.actorUsername || 'system';
         const stale = current.filter((row) => {
             const bm = normalizeBillingMonthKey(row.billingMonth);
             if (!scopedMonths.includes(bm)) return false;
+            if (scopedProviders.length > 0 && !scopedProviders.includes(String(row.provider ?? '').trim().toLowerCase())) {
+                return false;
+            }
             return !incomingKeys.has(externalInvoiceCompositeKey(row));
         });
 
@@ -1076,6 +1164,10 @@ export const createExternalInvoiceDebit = async (input: {
         payDueDate = stub.payDueDate ?? seed.payDueDate ?? null;
     }
 
+    const tax = applyInvoiceTaxFields(input.amount, {
+        taxRate: (seed as any).taxRate,
+    });
+
     const invoice = repo.create({
         username,
         fullName: seed.fullName ?? '',
@@ -1085,7 +1177,12 @@ export const createExternalInvoiceDebit = async (input: {
         provider,
         billingMonth,
         debitLabel: label,
-        amount: input.amount,
+        amount: tax.amount,
+        subtotalAmount: tax.subtotalAmount,
+        taxRate: tax.taxRate,
+        taxAmount: tax.taxAmount,
+        totalAmount: tax.totalAmount,
+        documentType: 'invoice',
         status: input.status || 'pending',
         payDueDate,
         modifiedBy: input.actorUsername,

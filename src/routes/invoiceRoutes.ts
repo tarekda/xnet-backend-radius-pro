@@ -1,6 +1,6 @@
 // src/routes/invoice.routes.ts
 import { Router } from "express";
-import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler } from "../controllers/invoiceController";
+import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler, previewMyISPInvoicesHandler, importMyISPInvoicesHandler, previewMyISP2InvoicesHandler, importMyISP2InvoicesHandler, previewRadiusInvoicesHandler, importRadiusInvoicesHandler, previewIDMInvoicesHandler, importIDMInvoicesHandler, previewTerraInvoicesHandler, importTerraInvoicesHandler } from "../controllers/invoiceController";
 import multer from "multer";
 import { authenticateToken, authorizeAnyPermissions, authorizePermissions, authorizeRoles } from '../middleware/authMiddleware';
 const upload = multer({
@@ -51,6 +51,16 @@ router.post("/reconcile/:invoiceId", authenticateToken, authorizeRoles('collecto
 router.post("/bulk-pay", authenticateToken, authorizeRoles('admin','manager'), bulkPayInvoicesHandler);
 router.post("/upload/preview", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), upload.single("file"), previewExternalInvoiceFile);
 router.post("/upload", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), upload.single("file"), uploadExternalInvoiceFile);
+router.post("/myisp/preview", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), previewMyISPInvoicesHandler);
+router.post("/myisp/import", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), importMyISPInvoicesHandler);
+router.post("/myisp2/preview", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), previewMyISP2InvoicesHandler);
+router.post("/myisp2/import", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), importMyISP2InvoicesHandler);
+router.post("/radius/preview", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), previewRadiusInvoicesHandler);
+router.post("/radius/import", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), importRadiusInvoicesHandler);
+router.post("/idm/preview", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), previewIDMInvoicesHandler);
+router.post("/idm/import", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), importIDMInvoicesHandler);
+router.post("/terra/preview", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), previewTerraInvoicesHandler);
+router.post("/terra/import", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), importTerraInvoicesHandler);
 router.get(
   "/whatsapp/diagnostics",
   authenticateToken,

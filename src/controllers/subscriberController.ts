@@ -16,7 +16,7 @@ import {
   createWhishPaymentClaim,
   listClaimsForInvoice,
 } from "../services/whishPaymentClaimService";
-import { getWalletBalance, payInvoiceFromWallet } from "../services/subscriberWalletService";
+import { getWalletBalance, payInvoiceFromWallet, listWalletLedger, getWalletPaidTowardInvoice } from "../services/subscriberWalletService";
 
 const jwtSecret = getJwtSecret();
 const refreshTokenSecret = getRefreshTokenSecret();
@@ -211,7 +211,22 @@ export const subscriberInvoices = async (req: Request, res: Response) => {
     order: { billingMonth: "DESC" } as any,
     take: 100,
   });
-  res.status(200).json({ success: true, data: invoices });
+  const enriched = await Promise.all(
+    invoices.map(async (inv) => {
+      const due = Number(inv.totalAmount ?? inv.amount ?? 0);
+      const paid =
+        String(inv.status).toLowerCase() === "paid"
+          ? due
+          : await getWalletPaidTowardInvoice(inv.id!);
+      const remainingDue = Math.max(0, Math.round((due - paid) * 100) / 100);
+      return {
+        ...inv,
+        amountPaidToward: Math.round(paid * 100) / 100,
+        remainingDue,
+      };
+    })
+  );
+  res.status(200).json({ success: true, data: enriched });
 };
 
 export const subscriberInvoiceDetail = async (req: Request, res: Response) => {
@@ -308,7 +323,15 @@ export const subscriberWallet = async (req: Request, res: Response) => {
   res.status(200).json({ success: true, data: { username, balance, currency: "USD" } });
 };
 
-/** Pay unpaid invoice from wallet balance; renews account if expired. */
+export const subscriberWalletLedger = async (req: Request, res: Response) => {
+  const username = req.subscriber!.username;
+  const page = parseInt(String(req.query.page || "1"), 10);
+  const limit = parseInt(String(req.query.limit || "30"), 10);
+  const result = await listWalletLedger({ username, page, limit });
+  res.status(200).json({ success: true, ...result });
+};
+
+/** Pay unpaid invoice from wallet balance; renews account if expired. Supports partial pay. */
 export const subscriberPayFromWallet = async (req: Request, res: Response) => {
   try {
     const username = req.subscriber!.username;
@@ -318,14 +341,18 @@ export const subscriberPayFromWallet = async (req: Request, res: Response) => {
       username,
       actorUsername: username,
       renewMonths: req.body?.months != null ? Number(req.body.months) : 1,
+      amount: req.body?.amount != null ? Number(req.body.amount) : undefined,
     });
-    res.status(200).json({
-      success: true,
-      message: result.alreadyPaid
-        ? "Invoice already paid"
+    const message = result.alreadyPaid
+      ? "Invoice already paid"
+      : result.partial
+        ? `Partial payment applied — $${Number(result.amountApplied).toFixed(2)} paid, $${Number(result.remainingDue).toFixed(2)} remaining`
         : result.renewed
           ? "Paid from wallet and account renewed"
-          : "Paid from wallet",
+          : "Paid from wallet";
+    res.status(200).json({
+      success: true,
+      message,
       data: result,
     });
   } catch (e: any) {

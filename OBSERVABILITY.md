@@ -32,6 +32,25 @@ Prometheus UI (optional):
 
 - Open `http://localhost:9090` and verify target `backend` is **UP**.
 
+## FreeRADIUS NOC metrics
+
+The RADIUS container runs a Status-Server → Prometheus exporter when `RADIUS_METRICS_ENABLED=1` (default).
+
+- **Exporter**: `http://<radius-host>:9812/metrics`
+- **Scrape job**: `freeradius` in `observability/prometheus/prometheus.yml.tmpl` → `host.docker.internal:9812`
+- **Alerts**: `FreeRadiusDown`, `FreeRadiusHighRejectRate` in `observability/prometheus/alerts.yml`
+
+### Quick validation
+
+- `curl http://localhost:9812/metrics | head`
+- In Prometheus UI, verify target `freeradius` is **UP**
+- Minimum metrics: `freeradius_up`, `freeradius_access_requests_total`, `freeradius_access_accepts_total`, `freeradius_access_rejects_total`, `freeradius_accounting_requests_total`
+
+### Env
+
+- `RADIUS_METRICS_ENABLED=1`
+- `RADIUS_METRICS_PORT=9812`
+
 ## Notes
 
 - If Redis or DB are down/unreachable, `/api/ready` returns `503` so orchestrators can avoid routing traffic.
