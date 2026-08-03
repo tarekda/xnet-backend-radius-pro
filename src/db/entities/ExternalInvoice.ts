@@ -36,6 +36,15 @@ export class ExternalInvoice {
   @Column("int", { name: "parent_invoice_id", nullable: true })
   parentInvoiceId: number | null;
 
+  @Column("timestamp", { name: "voided_at", nullable: true })
+  voidedAt: Date | null;
+
+  @Column("varchar", { name: "voided_by", nullable: true, length: 64 })
+  voidedBy: string | null;
+
+  @Column("varchar", { name: "void_reason", nullable: true, length: 255 })
+  voidReason: string | null;
+
   @Column("varchar", { name: "status", length: 10, default: () => "'unpaid'" })
   status: string;
 

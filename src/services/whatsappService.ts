@@ -180,6 +180,50 @@ function getTwilioHttpAuth(): TwilioHttpAuth | null {
     return null;
 }
 
+function getTwilioHttpAuthCandidates(): TwilioHttpAuth[] {
+    const candidates: TwilioHttpAuth[] = [];
+    const primary = getTwilioHttpAuth();
+    if (primary) candidates.push(primary);
+
+    const accountSid = getTwilioAccountSid();
+    const authToken = String(process.env.TWILIO_AUTH_TOKEN ?? "").trim();
+    if (
+        accountSid &&
+        authToken &&
+        !candidates.some((candidate) => candidate.mode === "auth-token")
+    ) {
+        candidates.push({ username: accountSid, password: authToken, mode: "auth-token" });
+    }
+    return candidates;
+}
+
+async function withTwilioAuthFallback<T>(
+    operation: (auth: TwilioHttpAuth) => Promise<T>
+): Promise<{ result: T; auth: TwilioHttpAuth }> {
+    const candidates = getTwilioHttpAuthCandidates();
+    if (candidates.length === 0) {
+        throw new Error("Twilio authentication credentials are missing");
+    }
+
+    let lastError: unknown;
+    for (let index = 0; index < candidates.length; index += 1) {
+        const auth = candidates[index];
+        try {
+            return { result: await operation(auth), auth };
+        } catch (error: any) {
+            lastError = error;
+            const canTryNext =
+                error?.response?.status === 401 && index < candidates.length - 1;
+            if (!canTryNext) throw error;
+            console.warn(
+                `[whatsapp] Twilio ${auth.mode} credentials were rejected; retrying with ${candidates[index + 1].mode}`
+            );
+        }
+    }
+
+    throw lastError;
+}
+
 function twilioMessagesUrl(accountSid: string): string {
     return `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
 }
@@ -269,15 +313,16 @@ export async function testTwilioCredentials(): Promise<{
     accountStatus?: string;
 }> {
     const accountSid = getTwilioAccountSid();
-    const auth = getTwilioHttpAuth();
-    if (!accountSid || !auth) {
+    if (!accountSid || getTwilioHttpAuthCandidates().length === 0) {
         return { ok: false, message: "Missing TWILIO_ACCOUNT_SID or auth credentials" };
     }
     try {
-        const resp = await axios.get(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}.json`, {
-            auth: { username: auth.username, password: auth.password },
-            timeout: 10000,
-        });
+        const { result: resp } = await withTwilioAuthFallback((auth) =>
+            axios.get(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}.json`, {
+                auth: { username: auth.username, password: auth.password },
+                timeout: 10000,
+            })
+        );
         return { ok: true, accountStatus: String(resp.data?.status ?? "unknown") };
     } catch (e: any) {
         return {
@@ -362,16 +407,17 @@ export async function validateWhatsAppAtStartup(): Promise<void> {
     logTwilioCredentialDiagnostics("startup");
 
     const accountSid = getTwilioAccountSid();
-    const auth = getTwilioHttpAuth();
-    if (!accountSid || !auth) {
+    if (!accountSid || getTwilioHttpAuthCandidates().length === 0) {
         console.warn("[whatsapp] Twilio credentials missing; skipping startup check");
         return;
     }
     try {
-        const resp = await axios.get(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}.json`, {
-            auth: { username: auth.username, password: auth.password },
-            timeout: 10000,
-        });
+        const { result: resp, auth } = await withTwilioAuthFallback((candidate) =>
+            axios.get(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}.json`, {
+                auth: { username: candidate.username, password: candidate.password },
+                timeout: 10000,
+            })
+        );
         const from = normalizeTwilioWhatsAppFrom(process.env.TWILIO_WHATSAPP_FROM);
         console.log(
             `[whatsapp] Twilio credentials OK (${auth.mode}, account ${resp.data?.status ?? "unknown"}, sender ${from ?? "messaging-service"})`
@@ -397,12 +443,16 @@ export async function sendWhatsAppMessageStrict(
 
     if (provider === "twilio") {
         const accountSid = getTwilioAccountSid();
-        const auth = getTwilioHttpAuth();
         const from = normalizeTwilioWhatsAppFrom(process.env.TWILIO_WHATSAPP_FROM);
         const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
         const contentSid = opts.contentSid || resolveTwilioContentSid(opts.templateKind);
 
-        if (!accountSid || !auth || (!from && !messagingServiceSid) || !contentSid) {
+        if (
+            !accountSid ||
+            getTwilioHttpAuthCandidates().length === 0 ||
+            (!from && !messagingServiceSid) ||
+            !contentSid
+        ) {
             throw new Error(formatProviderConfigError(provider));
         }
 
@@ -458,11 +508,13 @@ export async function sendWhatsAppMessageStrict(
         logTwilioCredentialDiagnostics("before send");
 
         try {
-            const sendResp = await axios.post(url, new URLSearchParams(params).toString(), {
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                auth: { username: auth.username, password: auth.password },
-                timeout: 10000,
-            });
+            const { result: sendResp, auth } = await withTwilioAuthFallback((candidate) =>
+                axios.post(url, new URLSearchParams(params).toString(), {
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    auth: { username: candidate.username, password: candidate.password },
+                    timeout: 10000,
+                })
+            );
             const sid = sendResp?.data?.sid as string | undefined;
 
             // Twilio accepts the request but delivery can still fail asynchronously.
@@ -628,11 +680,10 @@ async function sendViaCloud({ to, message }: WhatsAppSendOptions): Promise<void>
 
 async function sendViaTwilio(opts: WhatsAppSendOptions): Promise<void> {
     const accountSid = getTwilioAccountSid();
-    const auth = getTwilioHttpAuth();
     const from = normalizeTwilioWhatsAppFrom(process.env.TWILIO_WHATSAPP_FROM);
     const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
 
-    if (!accountSid || !auth || (!from && !messagingServiceSid)) {
+    if (!accountSid || getTwilioHttpAuthCandidates().length === 0 || (!from && !messagingServiceSid)) {
         console.warn("Twilio not configured: missing TWILIO_ACCOUNT_SID, auth credentials, and either TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID");
         return;
     }
@@ -762,7 +813,6 @@ function isTwilioOutsideWindowError(error: any): boolean {
 async function sendViaTwilioTemplate(opts: WhatsAppSendOptions): Promise<void> {
     const { to, message, templateVariables, templateKind } = opts;
     const accountSid = getTwilioAccountSid();
-    const auth = getTwilioHttpAuth();
     const from = normalizeTwilioWhatsAppFrom(process.env.TWILIO_WHATSAPP_FROM);
     const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
     let contentSid: string;
@@ -773,7 +823,12 @@ async function sendViaTwilioTemplate(opts: WhatsAppSendOptions): Promise<void> {
         return;
     }
 
-    if (!accountSid || !auth || (!from && !messagingServiceSid) || !contentSid) {
+    if (
+        !accountSid ||
+        getTwilioHttpAuthCandidates().length === 0 ||
+        (!from && !messagingServiceSid) ||
+        !contentSid
+    ) {
         console.warn("Twilio template not configured: require TWILIO_ACCOUNT_SID, auth credentials, (TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID), and content SID");
         return;
     }
@@ -834,11 +889,14 @@ async function sendViaTwilioTemplate(opts: WhatsAppSendOptions): Promise<void> {
 
     const body = new URLSearchParams(params).toString();
     try {
-        const { data } = await axios.post(url, body, {
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            auth: { username: auth.username, password: auth.password },
-            timeout: 10000,
-        });
+        const { result } = await withTwilioAuthFallback((auth) =>
+            axios.post(url, body, {
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                auth: { username: auth.username, password: auth.password },
+                timeout: 10000,
+            })
+        );
+        const { data } = result;
         console.log("Twilio template SID:", data.sid);
     } catch (error: any) {
         const status = error?.response?.status;

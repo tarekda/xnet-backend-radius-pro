@@ -1,6 +1,11 @@
 // src/routes/invoice.routes.ts
 import { Router } from "express";
-import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler, previewMyISPInvoicesHandler, importMyISPInvoicesHandler, previewMyISP2InvoicesHandler, importMyISP2InvoicesHandler, previewRadiusInvoicesHandler, importRadiusInvoicesHandler, previewIDMInvoicesHandler, importIDMInvoicesHandler, previewTerraInvoicesHandler, importTerraInvoicesHandler } from "../controllers/invoiceController";
+import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceByIdHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, sharePaidExternalInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler, previewMyISPInvoicesHandler, importMyISPInvoicesHandler, previewMyISP2InvoicesHandler, importMyISP2InvoicesHandler, previewRadiusInvoicesHandler, importRadiusInvoicesHandler, previewIDMInvoicesHandler, importIDMInvoicesHandler, previewTerraInvoicesHandler, importTerraInvoicesHandler } from "../controllers/invoiceController";
+import {
+  dismissWhatsappPaymentAmbiguityHandler,
+  listWhatsappPaymentAmbiguitiesHandler,
+  resolveWhatsappPaymentAmbiguityHandler,
+} from "../controllers/whatsappPaymentAmbiguityController";
 import multer from "multer";
 import { authenticateToken, authorizeAnyPermissions, authorizePermissions, authorizeRoles } from '../middleware/authMiddleware';
 const upload = multer({
@@ -117,6 +122,27 @@ router.get(
   getExternalInvoicesPaymentDueHandler
 );
 router.get(
+  "/external/whatsapp-payment-ambiguities",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.pay"
+  ),
+  listWhatsappPaymentAmbiguitiesHandler
+);
+router.post(
+  "/external/whatsapp-payment-ambiguities/:ambiguityId/resolve",
+  authenticateToken,
+  authorizePermissions("billing.externalInvoices.pay"),
+  resolveWhatsappPaymentAmbiguityHandler
+);
+router.post(
+  "/external/whatsapp-payment-ambiguities/:ambiguityId/dismiss",
+  authenticateToken,
+  authorizePermissions("billing.externalInvoices.pay"),
+  dismissWhatsappPaymentAmbiguityHandler
+);
+router.get(
   "/external/:invoiceId/history",
   authenticateToken,
   authorizeAnyPermissions(
@@ -144,6 +170,17 @@ router.post(
     "billing.externalInvoices.unpay"
   ),
   remindExternalInvoiceHandler
+);
+router.post(
+  "/external/:invoiceId/share-paid",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.viewTotals",
+    "billing.externalInvoices.pay",
+    "billing.externalInvoices.unpay"
+  ),
+  sharePaidExternalInvoiceHandler
 );
 router.post(
   "/external/:invoiceId/workflow",
@@ -199,6 +236,17 @@ router.get(
     "billing.externalInvoices.unpay"
   ),
   getExternalInvoicePaymentLinesHandler
+);
+router.get(
+  "/external/:invoiceId",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.viewTotals",
+    "billing.externalInvoices.pay",
+    "billing.externalInvoices.unpay"
+  ),
+  getExternalInvoiceByIdHandler
 );
 router.post(
   "/external/debit",

@@ -3,6 +3,7 @@ import { authenticateToken, authorizeAnyPermissions } from "../middleware/authMi
 import {
   createPaymentIntent,
   createCreditNote,
+  voidCreditNote,
   getPaymentProviderStatus,
   handlePaymentWebhook,
   parseWhishCallbackPayload,
@@ -226,6 +227,26 @@ router.post(
       res.status(201).json({ success: true, data: note });
     } catch (e: any) {
       res.status(400).json({ success: false, message: e?.message || "Failed to create credit note" });
+    }
+  }
+);
+
+router.post(
+  "/external/:creditNoteId/void",
+  authenticateToken,
+  authorizeAnyPermissions("billing.externalInvoices.pay", "billing.externalInvoices.unpay"),
+  async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(String(req.params.creditNoteId), 10);
+      if (!Number.isFinite(id) || id <= 0) {
+        res.status(400).json({ success: false, message: "Invalid credit note ID" });
+        return;
+      }
+      const actor = (req.user as any)?.username || "system";
+      const note = await voidCreditNote(id, actor, req.body?.voidReason);
+      res.status(200).json({ success: true, data: note });
+    } catch (e: any) {
+      res.status(400).json({ success: false, message: e?.message || "Failed to void credit note" });
     }
   }
 );

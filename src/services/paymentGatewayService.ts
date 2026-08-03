@@ -1,8 +1,9 @@
 import crypto from "crypto";
-import { Equal } from "typeorm";
+import { Equal, IsNull } from "typeorm";
 import { AppDataSource } from "../db/config";
 import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import { PaymentIntent } from "../db/entities/PaymentIntent";
+import { invoiceEvents } from "../events/invoiceEvents";
 import { payExternalInvoice } from "./invoiceService";
 import {
   createWhishPaymentInvoice,
@@ -295,6 +296,7 @@ export async function createCreditNote(parentInvoiceId: number, actorUsername: s
     where: {
       parentInvoiceId: Equal(parentInvoiceId),
       documentType: Equal("credit_note") as any,
+      voidedAt: IsNull(),
     },
   });
   if (existing) throw new Error(`Credit note #${existing.id} already exists for this invoice`);
@@ -333,7 +335,82 @@ export async function createCreditNote(parentInvoiceId: number, actorUsername: s
     modifiedBy: actorUsername,
     modifiedAt: new Date(),
   });
-  return repo.save(note);
+  const saved = await repo.save(note);
+  invoiceEvents.emitModification({
+    invoiceId: saved.id || -1,
+    username: actorUsername,
+    action: "UPDATED",
+    timestamp: new Date(),
+    changes: {
+      kind: "CREDIT_NOTE_CREATED",
+      parentInvoiceId: parent.id,
+      amount: totalAmount,
+    },
+    data: { username: saved.username, persistLastAction: "CREDIT_NOTE" },
+  });
+  return saved;
+}
+
+export async function voidCreditNote(
+  creditNoteId: number,
+  actorUsername: string,
+  voidReason: string
+) {
+  const reason = String(voidReason || "").trim();
+  if (reason.length < 3) {
+    throw new Error("A void reason of at least 3 characters is required");
+  }
+  if (reason.length > 255) {
+    throw new Error("Void reason must be 255 characters or fewer");
+  }
+
+  const repo = AppDataSource.getRepository(ExternalInvoice);
+  const note = await repo.findOne({ where: { id: Equal(creditNoteId) } });
+  if (!note) throw new Error("Credit note not found");
+  if (note.documentType !== "credit_note") {
+    throw new Error("Only credit notes can be voided");
+  }
+  if (note.voidedAt) {
+    throw new Error("Credit note is already voided");
+  }
+
+  const now = new Date();
+  note.voidedAt = now;
+  note.voidedBy = actorUsername;
+  note.voidReason = reason;
+  note.lastAction = "CREDIT_NOTE_VOIDED";
+  note.modifiedBy = actorUsername;
+  note.modifiedAt = now;
+  const saved = await repo.save(note);
+
+  invoiceEvents.emitModification({
+    invoiceId: saved.id || -1,
+    username: actorUsername,
+    action: "VOIDED",
+    timestamp: now,
+    changes: {
+      kind: "CREDIT_NOTE_VOIDED",
+      voidReason: reason,
+      parentInvoiceId: saved.parentInvoiceId,
+    },
+    data: { username: saved.username, persistLastAction: "CREDIT_NOTE_VOIDED" },
+  });
+  if (saved.parentInvoiceId) {
+    invoiceEvents.emitModification({
+      invoiceId: saved.parentInvoiceId,
+      username: actorUsername,
+      action: "UPDATED",
+      timestamp: now,
+      changes: {
+        kind: "CREDIT_NOTE_VOIDED",
+        creditNoteId: saved.id,
+        voidReason: reason,
+      },
+      data: { username: saved.username },
+    });
+  }
+
+  return saved;
 }
 
 export async function getOpenCheckoutUrl(externalInvoiceId: number): Promise<string | null> {

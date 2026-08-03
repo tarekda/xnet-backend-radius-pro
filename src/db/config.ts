@@ -40,6 +40,7 @@ import { CableVisionInvoice } from './entities/CableVisionInvoice';
 import { SubscriberRefreshTokens } from './entities/SubscriberRefreshTokens';
 import { PaymentIntent } from './entities/PaymentIntent';
 import { WhishPaymentClaim } from './entities/WhishPaymentClaim';
+import { WhatsappPaymentAmbiguity } from './entities/WhatsappPaymentAmbiguity';
 import { SubscriberWalletEntry } from './entities/SubscriberWalletEntry';
 
 // Create entities array with explicit references
@@ -65,6 +66,7 @@ const entities = [
     SubscriberRefreshTokens,
     PaymentIntent,
     WhishPaymentClaim,
+    WhatsappPaymentAmbiguity,
     SubscriberWalletEntry,
     Role,
     RolePermission,

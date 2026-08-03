@@ -41,6 +41,8 @@ import auditRoutes from './routes/auditRoutes';
 import backupRoutes from './routes/backupRoutes';
 import cableVisionRoutes from './routes/cableVisionRoutes';
 import aiRoutes from './routes/aiRoutes';
+import whatsappWebhookRoutes, { whatsappTwilioWebhookRouter } from './routes/whatsappWebhookRoutes';
+import { setWsBroadcast } from './realtime/wsHub';
 import './events/invoiceListeners'
 import cors from 'cors';
 import { beginShutdown } from './state/shutdown';
@@ -57,6 +59,18 @@ dotenv.config();
 assertProductionSecrets();
 
 const app = express();
+
+// WhatsApp inbound webhooks need raw / form bodies (must be registered before express.json()).
+app.use(
+  '/api/webhooks/whatsapp',
+  express.raw({ type: 'application/json' }),
+  whatsappWebhookRoutes
+);
+app.use(
+  '/api/webhooks/whatsapp/twilio',
+  express.urlencoded({ extended: false }),
+  whatsappTwilioWebhookRouter
+);
 
 // Middleware to parse JSON bodies
 app.use(express.json());
@@ -164,6 +178,7 @@ export const broadcastMessage = (message: any) => {
         }
     });
 };
+setWsBroadcast(broadcastMessage);
 
 // Apply security middlewares
 securityMiddleware(app);

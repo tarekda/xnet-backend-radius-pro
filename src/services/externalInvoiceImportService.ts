@@ -1,6 +1,7 @@
 import { IsNull } from 'typeorm';
 import { AppDataSource } from '../db/config';
 import { ExternalInvoice } from '../db/entities/ExternalInvoice';
+import type { ImportPreviewResult } from './externalInvoiceImportParser';
 import {
   applyDefaultPayDueDates,
   enrichExternalInvoicesFromUserDetails,
@@ -19,7 +20,49 @@ export type ExternalInvoiceImportPipelineOptions = {
   payDueDayOffset?: unknown;
   overrideIncomingPayDueDates?: boolean;
   actorUsername?: string;
+  /** When false, do not soft-delete provider rows missing from this batch (use for partial username imports). */
+  reconcileScope?: boolean;
 };
+
+/** Parse username filter from API body: array, comma, newline, or semicolon separated. */
+export function parseImportUsernameFilter(raw: unknown): string[] | undefined {
+  if (raw == null) return undefined;
+  const chunks: string[] = [];
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      chunks.push(...String(item).split(/[\n\r,;]+/));
+    }
+  } else {
+    chunks.push(...String(raw).split(/[\n\r,;]+/));
+  }
+  const list = chunks.map((s) => s.trim()).filter(Boolean);
+  return list.length ? list : undefined;
+}
+
+export function filterInvoicesByUsernames(
+  invoices: Partial<ExternalInvoice>[],
+  usernames?: string[]
+): Partial<ExternalInvoice>[] {
+  if (!usernames?.length) return invoices;
+  const allow = new Set(usernames.map((u) => u.trim().toLowerCase()).filter(Boolean));
+  return invoices.filter((inv) => allow.has(String(inv.username ?? '').trim().toLowerCase()));
+}
+
+export function adjustPreviewForUsernameFilter(
+  preview: ImportPreviewResult,
+  sourceInvoiceCount: number,
+  filtered: Partial<ExternalInvoice>[]
+): ImportPreviewResult {
+  if (filtered.length === sourceInvoiceCount) return preview;
+  const excluded = sourceInvoiceCount - filtered.length;
+  return {
+    ...preview,
+    totalRows: filtered.length,
+    validRowCount: filtered.length,
+    skippedRowCount: preview.skippedRowCount + excluded,
+    mappedPreview: filtered.slice(0, 10),
+  };
+}
 
 /**
  * Shared post-parse pipeline for every external invoice import source.
@@ -36,6 +79,7 @@ export async function importExternalInvoices(
     payDueDayOffset: payDueDayOffsetRaw,
     overrideIncomingPayDueDates = true,
     actorUsername,
+    reconcileScope = true,
   } = options;
 
   if (skippedCount > 0) {
@@ -74,15 +118,18 @@ export async function importExternalInvoices(
     }
   }
 
-  const scopedBillingMonths = monthOverride
-    ? [monthOverride]
-    : [
-        ...new Set(
-          withCarryover.map((invoice) =>
-            normalizeBillingMonthKey(invoice.billingMonth as string)
-          )
-        ),
-      ];
+  const scopedBillingMonths =
+    reconcileScope === false
+      ? []
+      : monthOverride
+        ? [monthOverride]
+        : [
+            ...new Set(
+              withCarryover.map((invoice) =>
+                normalizeBillingMonthKey(invoice.billingMonth as string)
+              )
+            ),
+          ];
 
   const upsertResult = await upsertExternalInvoices(withCarryover, {
     scopedBillingMonths,

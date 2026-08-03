@@ -444,7 +444,7 @@ export const payExternalInvoice = async (
     invoiceId: number,
     actorUsername: string,
     paymentMethod: 'cash' | 'pos' | 'transfer' | 'other' | 'gateway' | 'wallet' = 'cash',
-    extras?: { paymentReference?: string | null; paymentProvider?: string | null }
+    extras?: { paymentReference?: string | null; paymentProvider?: string | null; paidAmount?: number | null }
 ) => {
     return AppDataSource.transaction(async (manager) => {
         const invoiceRepo = manager.getRepository(ExternalInvoice);
@@ -459,6 +459,17 @@ export const payExternalInvoice = async (
         if (String(invoice.status).toLowerCase() === "paid") {
             recordInvoicePayment("external_pay", "idempotent");
             return invoice;
+        }
+
+        const paidAmount = extras?.paidAmount;
+        if (paidAmount != null && Number.isFinite(paidAmount) && paidAmount > 0) {
+            invoice.amount = paidAmount;
+            if (invoice.totalAmount != null) {
+                invoice.totalAmount = paidAmount;
+            }
+            if (invoice.subtotalAmount != null) {
+                invoice.subtotalAmount = paidAmount;
+            }
         }
 
         invoice.status = "paid";
@@ -1297,22 +1308,30 @@ export const getAllExternalInvoices = async (
     applyMissingDataFilter(baseQb, 'externalInvoice', missingData);
     applyPayDueFilter(baseQb, 'externalInvoice', payDueFilter);
 
-    const totalPaid = await baseQb
+    // Keep voided credit notes visible in the list, but exclude them from all
+    // financial metrics and document counts.
+    const financialBaseQb = baseQb
+        .clone()
+        .andWhere("externalInvoice.voidedAt IS NULL");
+
+    const totalFinancialInvoices = await financialBaseQb.clone().getCount();
+
+    const totalPaid = await financialBaseQb
         .clone()
         .andWhere("externalInvoice.status = 'paid'")
         .getCount();
 
-    const totalUnpaid = await baseQb
+    const totalUnpaid = await financialBaseQb
         .clone()
         .andWhere("externalInvoice.status = 'unpaid'")
         .getCount();
 
-    const totalPending = await baseQb
+    const totalPending = await financialBaseQb
         .clone()
         .andWhere("externalInvoice.status = 'pending'")
         .getCount();
 
-    const totalAmount = await baseQb
+    const totalAmount = await financialBaseQb
         .clone()
         .select("SUM(externalInvoice.amount)", "sum")
         .getRawOne<{ sum: string }>();
@@ -1323,7 +1342,7 @@ export const getAllExternalInvoices = async (
         page,
         totalPages: Math.ceil(total / limit),
         metrics: {
-            totalInvoices: total,
+            totalInvoices: totalFinancialInvoices,
             totalPaid,
             totalUnpaid,
             totalPending,
@@ -1360,7 +1379,8 @@ export const getExternalInvoicesAgingSummary = async (params: {
     const { search = '', from, to, status, graceDays = 7 } = params;
     const repo = AppDataSource.getRepository(ExternalInvoice);
     const qb = repo.createQueryBuilder('externalInvoice')
-        .where('externalInvoice.deletedAt IS NULL');
+        .where('externalInvoice.deletedAt IS NULL')
+        .andWhere('externalInvoice.voidedAt IS NULL');
 
     if (search) {
         qb.andWhere(
@@ -1480,6 +1500,7 @@ export const getExternalInvoicesMonthlyTrend = async (months = 6) => {
         .addSelect('COALESCE(SUM(e.amount), 0)', 'totalAmount')
         .addSelect("COALESCE(SUM(CASE WHEN e.status = 'paid' THEN e.amount ELSE 0 END), 0)", 'paidAmount')
         .where('e.deletedAt IS NULL')
+        .andWhere('e.voidedAt IS NULL')
         .andWhere('e.billingMonth >= DATE_SUB(CURDATE(), INTERVAL :months MONTH)', { months: safeMonths })
         .groupBy("DATE_FORMAT(e.billingMonth, '%Y-%m')")
         .orderBy('month', 'ASC')
@@ -1506,11 +1527,22 @@ export const getExternalInvoicesPaymentDueTracker = async (): Promise<ExternalIn
     return repo
         .createQueryBuilder('e')
         .where('e.deletedAt IS NULL')
+        .andWhere('e.voidedAt IS NULL')
         .andWhere('e.payDueDate IS NOT NULL')
         .andWhere("e.status IN (:...st)", { st: ['unpaid', 'pending'] })
         .orderBy('e.payDueDate', 'ASC')
         .addOrderBy('e.id', 'ASC')
         .getMany();
+};
+
+export const getExternalInvoiceById = async (invoiceId: number): Promise<ExternalInvoice> => {
+    const invoice = await AppDataSource.getRepository(ExternalInvoice).findOne({
+        where: { id: invoiceId },
+    });
+    if (!invoice) {
+        throw new Error('External invoice not found');
+    }
+    return invoice;
 };
 
 export const getExternalInvoiceHistory = async (invoiceId: number, limit = 100) => {
@@ -1730,7 +1762,8 @@ export const getCollectedMetrics = async (dateFrom?: string, dateTo?: string) =>
     const repo = AppDataSource.getRepository(ExternalInvoice);
     const qb = repo.createQueryBuilder('ext')
         .where('ext.collectedBy IS NOT NULL')
-        .andWhere('ext.deletedAt IS NULL');
+        .andWhere('ext.deletedAt IS NULL')
+        .andWhere('ext.voidedAt IS NULL');
 
     if (dateFrom && dateTo) {
         if (isYmdOnly(dateFrom) && isYmdOnly(dateTo)) {
@@ -1770,6 +1803,7 @@ export const getCollectorBreakdown = async (dateFrom?: string, dateTo?: string) 
         .addSelect('SUM(ext.amount)', 'totalAmount')
         .where('ext.collectedBy IS NOT NULL')
         .andWhere('ext.deletedAt IS NULL')
+        .andWhere('ext.voidedAt IS NULL')
         .groupBy('ext.collectedBy')
         .orderBy('totalAmount', 'DESC');
 
@@ -1813,6 +1847,7 @@ export const getCollectedInvoicesList = async (
     const qb = repo.createQueryBuilder('ext')
         .where('ext.collectedBy IS NOT NULL')
         .andWhere('ext.deletedAt IS NULL')
+        .andWhere('ext.voidedAt IS NULL')
         .orderBy('ext.collectedAt', 'DESC')
         .skip((page - 1) * limit)
         .take(limit);

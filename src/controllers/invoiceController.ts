@@ -18,6 +18,7 @@ import {
   getCollectedInvoicesList,
   unpayExternalInvoice,
   getExternalInvoicesAgingSummary,
+  getExternalInvoiceById,
   getExternalInvoiceHistory,
   setExternalInvoiceWorkflow,
   getExternalInvoicesPaymentDueTracker,
@@ -43,7 +44,8 @@ import { composePaidMessage, sendWhatsAppMessage, sendWhatsAppMessageStrict, get
 import { createPaymentIntent, getOpenCheckoutUrl } from "../services/paymentGatewayService";
 import { BadRequestError, coerceToAppError } from "../errors/AppError";
 import { recordDunningRun } from "../metrics/metrics";
-import { importExternalInvoices } from "../services/externalInvoiceImportService";
+import { importExternalInvoices, adjustPreviewForUsernameFilter, filterInvoicesByUsernames, parseImportUsernameFilter } from "../services/externalInvoiceImportService";
+import type { ImportPreviewResult } from "../services/externalInvoiceImportParser";
 import { fetchMyISPInvoices } from "../services/myispInvoiceService";
 import { fetchActiveRadiusInvoices } from "../services/radiusInvoiceImportService";
 import { fetchHsiProviderInvoices, HsiProvider } from "../services/hsiProviderInvoiceService";
@@ -63,6 +65,27 @@ const sendCaughtError = (res: Response, error: unknown, fallbackMessage: string)
     appErr.statusCode,
     appErr.expose ? appErr.message : fallbackMessage
   );
+};
+
+const resolveExternalInvoicePhone = async (invoice: ExternalInvoice): Promise<string> => {
+  const storedPhone = String(invoice.phoneNumber || "").trim();
+  if (storedPhone) return storedPhone;
+
+  const details = await AppDataSource.getRepository(UserDetails).findOne({
+    where: { username: invoice.username },
+  });
+  return String(details?.phoneNumber || "").trim();
+};
+
+const validateWhatsAppPhone = (phone: string): string | null => {
+  if (!phone) return "No registered phone number was found for this subscriber";
+  if (
+    phone === "9613000000" &&
+    String(process.env.WHATSAPP_OVERRIDE_TO || "").trim().length === 0
+  ) {
+    return "The registered phone number is a placeholder (9613000000). Update the subscriber phone number or set WHATSAPP_OVERRIDE_TO for testing.";
+  }
+  return null;
 };
 
 type DunningCandidate = {
@@ -265,6 +288,7 @@ const getDunningCandidates = async (params: {
   const rows = await repo
     .createQueryBuilder("ext")
     .where("ext.deletedAt IS NULL")
+    .andWhere("ext.voidedAt IS NULL")
     .andWhere("ext.status IN (:...statuses)", { statuses })
     .orderBy("ext.billingMonth", "ASC")
     .take(Math.max(params.limit * 5, params.limit))
@@ -716,14 +740,77 @@ function requireBillingMonth(value: unknown): string {
   return normalized;
 }
 
+type ProviderFetchResult = {
+  invoices: Partial<ExternalInvoice>[];
+  preview: ImportPreviewResult;
+};
+
+function readProviderImportOptions(req: Request) {
+  const billingMonth = requireBillingMonth(req.body?.billingMonth);
+  const usernames = parseImportUsernameFilter(req.body?.usernames ?? req.body?.usernameFilter);
+  const partialImport =
+    usernames?.length
+      ? req.body?.partialImport !== false && req.body?.partialImport !== "false"
+      : Boolean(req.body?.partialImport === true || req.body?.partialImport === "true");
+  return {
+    billingMonth,
+    usernames,
+    partialImport,
+    payDueDayOffset: req.body?.payDueDayOffset,
+    reconcileScope: !partialImport,
+  };
+}
+
+async function runProviderImportPreview(
+  req: Request,
+  res: Response,
+  successLabel: string,
+  fetch: () => Promise<ProviderFetchResult>
+) {
+  const { usernames } = readProviderImportOptions(req);
+  const { invoices, preview } = await fetch();
+  const filtered = filterInvoicesByUsernames(invoices, usernames);
+  const adjusted = adjustPreviewForUsernameFilter(preview, invoices.length, filtered);
+  return sendResponse(res, true, 200, `${successLabel} invoice preview generated`, adjusted);
+}
+
+async function runProviderImport(
+  req: Request,
+  res: Response,
+  successLabel: string,
+  scopedProviders: string[],
+  fetch: () => Promise<ProviderFetchResult>,
+  importExtras?: { overrideIncomingPayDueDates?: boolean }
+) {
+  const { billingMonth, usernames, partialImport, payDueDayOffset, reconcileScope } =
+    readProviderImportOptions(req);
+  const { invoices, preview } = await fetch();
+  const filtered = filterInvoicesByUsernames(invoices, usernames);
+  if (usernames?.length && filtered.length === 0) {
+    throw new BadRequestError(
+      `No ${successLabel} users matched the username filter (${usernames.join(", ")})`
+    );
+  }
+  const result = await importExternalInvoices({
+    invoices: filtered,
+    skippedCount: preview.skippedRowCount + (invoices.length - filtered.length),
+    monthOverride: billingMonth,
+    scopedProviders,
+    payDueDayOffset,
+    reconcileScope,
+    actorUsername: req.user?.username,
+    ...importExtras,
+  });
+  const suffix = partialImport ? " (partial — existing rows kept)" : "";
+  return sendResponse(res, true, 200, `${successLabel} invoices imported successfully${suffix}`, result);
+}
+
 export const previewMyISPInvoicesHandler = async (req: Request, res: Response) => {
   try {
-    const billingMonth = requireBillingMonth(req.body?.billingMonth);
-    const { preview } = await fetchMyISPInvoices(
-      billingMonth,
-      req.user?.username
+    const { billingMonth } = readProviderImportOptions(req);
+    return await runProviderImportPreview(req, res, "MyISP", () =>
+      fetchMyISPInvoices(billingMonth, req.user?.username)
     );
-    return sendResponse(res, true, 200, 'MyISP invoice preview generated', preview);
   } catch (error) {
     return sendCaughtError(res, error, 'Failed to preview MyISP invoices');
   }
@@ -731,20 +818,10 @@ export const previewMyISPInvoicesHandler = async (req: Request, res: Response) =
 
 export const importMyISPInvoicesHandler = async (req: Request, res: Response) => {
   try {
-    const billingMonth = requireBillingMonth(req.body?.billingMonth);
-    const { invoices, preview } = await fetchMyISPInvoices(
-      billingMonth,
-      req.user?.username
+    const { billingMonth } = readProviderImportOptions(req);
+    return await runProviderImport(req, res, "MyISP", ["myisp"], () =>
+      fetchMyISPInvoices(billingMonth, req.user?.username)
     );
-    const result = await importExternalInvoices({
-      invoices,
-      skippedCount: preview.skippedRowCount,
-      monthOverride: billingMonth,
-      scopedProviders: ['myisp'],
-      payDueDayOffset: req.body?.payDueDayOffset,
-      actorUsername: req.user?.username,
-    });
-    return sendResponse(res, true, 200, 'MyISP invoices imported successfully', result);
   } catch (error) {
     return sendCaughtError(res, error, 'Failed to import MyISP invoices');
   }
@@ -752,13 +829,10 @@ export const importMyISPInvoicesHandler = async (req: Request, res: Response) =>
 
 export const previewMyISP2InvoicesHandler = async (req: Request, res: Response) => {
   try {
-    const billingMonth = requireBillingMonth(req.body?.billingMonth);
-    const { preview } = await fetchMyISPInvoices(
-      billingMonth,
-      req.user?.username,
-      2
+    const { billingMonth } = readProviderImportOptions(req);
+    return await runProviderImportPreview(req, res, "MyISP account 2", () =>
+      fetchMyISPInvoices(billingMonth, req.user?.username, 2)
     );
-    return sendResponse(res, true, 200, 'MyISP account 2 invoice preview generated', preview);
   } catch (error) {
     return sendCaughtError(res, error, 'Failed to preview MyISP account 2 invoices');
   }
@@ -766,21 +840,10 @@ export const previewMyISP2InvoicesHandler = async (req: Request, res: Response) 
 
 export const importMyISP2InvoicesHandler = async (req: Request, res: Response) => {
   try {
-    const billingMonth = requireBillingMonth(req.body?.billingMonth);
-    const { invoices, preview } = await fetchMyISPInvoices(
-      billingMonth,
-      req.user?.username,
-      2
+    const { billingMonth } = readProviderImportOptions(req);
+    return await runProviderImport(req, res, "MyISP account 2", ["myisp2"], () =>
+      fetchMyISPInvoices(billingMonth, req.user?.username, 2)
     );
-    const result = await importExternalInvoices({
-      invoices,
-      skippedCount: preview.skippedRowCount,
-      monthOverride: billingMonth,
-      scopedProviders: ['myisp2'],
-      payDueDayOffset: req.body?.payDueDayOffset,
-      actorUsername: req.user?.username,
-    });
-    return sendResponse(res, true, 200, 'MyISP account 2 invoices imported successfully', result);
   } catch (error) {
     return sendCaughtError(res, error, 'Failed to import MyISP account 2 invoices');
   }
@@ -788,12 +851,10 @@ export const importMyISP2InvoicesHandler = async (req: Request, res: Response) =
 
 export const previewRadiusInvoicesHandler = async (req: Request, res: Response) => {
   try {
-    const billingMonth = requireBillingMonth(req.body?.billingMonth);
-    const { preview } = await fetchActiveRadiusInvoices(
-      billingMonth,
-      req.user?.username
+    const { billingMonth } = readProviderImportOptions(req);
+    return await runProviderImportPreview(req, res, "Active RADIUS", () =>
+      fetchActiveRadiusInvoices(billingMonth, req.user?.username)
     );
-    return sendResponse(res, true, 200, 'Active RADIUS invoice preview generated', preview);
   } catch (error) {
     return sendCaughtError(res, error, 'Failed to preview active RADIUS invoices');
   }
@@ -801,21 +862,15 @@ export const previewRadiusInvoicesHandler = async (req: Request, res: Response) 
 
 export const importRadiusInvoicesHandler = async (req: Request, res: Response) => {
   try {
-    const billingMonth = requireBillingMonth(req.body?.billingMonth);
-    const { invoices, preview } = await fetchActiveRadiusInvoices(
-      billingMonth,
-      req.user?.username
+    const { billingMonth } = readProviderImportOptions(req);
+    return await runProviderImport(
+      req,
+      res,
+      "Active RADIUS",
+      ["radius"],
+      () => fetchActiveRadiusInvoices(billingMonth, req.user?.username),
+      { overrideIncomingPayDueDates: false }
     );
-    const result = await importExternalInvoices({
-      invoices,
-      skippedCount: preview.skippedRowCount,
-      monthOverride: billingMonth,
-      scopedProviders: ['radius'],
-      payDueDayOffset: req.body?.payDueDayOffset,
-      overrideIncomingPayDueDates: false,
-      actorUsername: req.user?.username,
-    });
-    return sendResponse(res, true, 200, 'Active RADIUS invoices imported successfully', result);
   } catch (error) {
     return sendCaughtError(res, error, 'Failed to import active RADIUS invoices');
   }
@@ -823,13 +878,10 @@ export const importRadiusInvoicesHandler = async (req: Request, res: Response) =
 
 async function previewHsiProvider(provider: HsiProvider, req: Request, res: Response) {
   try {
-    const billingMonth = requireBillingMonth(req.body?.billingMonth);
-    const { preview } = await fetchHsiProviderInvoices(
-      provider,
-      billingMonth,
-      req.user?.username
+    const { billingMonth } = readProviderImportOptions(req);
+    return await runProviderImportPreview(req, res, provider.toUpperCase(), () =>
+      fetchHsiProviderInvoices(provider, billingMonth, req.user?.username)
     );
-    return sendResponse(res, true, 200, `${provider.toUpperCase()} invoice preview generated`, preview);
   } catch (error) {
     return sendCaughtError(res, error, `Failed to preview ${provider.toUpperCase()} invoices`);
   }
@@ -837,21 +889,10 @@ async function previewHsiProvider(provider: HsiProvider, req: Request, res: Resp
 
 async function importHsiProvider(provider: HsiProvider, req: Request, res: Response) {
   try {
-    const billingMonth = requireBillingMonth(req.body?.billingMonth);
-    const { invoices, preview } = await fetchHsiProviderInvoices(
-      provider,
-      billingMonth,
-      req.user?.username
+    const { billingMonth } = readProviderImportOptions(req);
+    return await runProviderImport(req, res, provider.toUpperCase(), [provider], () =>
+      fetchHsiProviderInvoices(provider, billingMonth, req.user?.username)
     );
-    const result = await importExternalInvoices({
-      invoices,
-      skippedCount: preview.skippedRowCount,
-      monthOverride: billingMonth,
-      scopedProviders: [provider],
-      payDueDayOffset: req.body?.payDueDayOffset,
-      actorUsername: req.user?.username,
-    });
-    return sendResponse(res, true, 200, `${provider.toUpperCase()} invoices imported successfully`, result);
   } catch (error) {
     return sendCaughtError(res, error, `Failed to import ${provider.toUpperCase()} invoices`);
   }
@@ -1030,6 +1071,24 @@ export const getExternalInvoicesPaymentDueHandler = async (req: Request, res: Re
   }
 };
 
+export const getExternalInvoiceByIdHandler = async (req: Request, res: Response) => {
+  try {
+    const invoiceId = parseInt(req.params.invoiceId, 10);
+    if (!Number.isFinite(invoiceId) || invoiceId <= 0) {
+      return sendResponse(res, false, 400, "Invalid invoice ID");
+    }
+    const invoice = await getExternalInvoiceById(invoiceId);
+    return sendResponse(res, true, 200, "External invoice fetched", invoice);
+  } catch (error) {
+    const message = (error as any)?.message || "Failed to fetch invoice";
+    if (message === "External invoice not found") {
+      return sendResponse(res, false, 404, message);
+    }
+    console.error("Error fetching external invoice:", error);
+    return sendResponse(res, false, 500, "Failed to fetch invoice");
+  }
+};
+
 export const getExternalInvoiceHistoryHandler = async (req: Request, res: Response) => {
   try {
     const invoiceId = parseInt(req.params.invoiceId);
@@ -1114,7 +1173,7 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
     // Fire-and-forget WhatsApp notification
     ;(async () => {
       try {
-        const phone = String(invoice.phoneNumber || '').trim();
+        const phone = await resolveExternalInvoicePhone(invoice);
         if (!phone) {
           console.warn('External invoice has no phone number; skipping WhatsApp', { invoiceId: invoice.id, username: invoice.username });
           return;
@@ -1182,21 +1241,16 @@ export const remindExternalInvoiceHandler = async (req: Request, res: Response) 
     if (!invoice) {
       return sendResponse(res, false, 404, "External invoice not found");
     }
+    if (invoice.voidedAt || invoice.documentType === "credit_note") {
+      return sendResponse(res, false, 400, "Credit notes cannot receive payment reminders");
+    }
+    if (String(invoice.status).toLowerCase() === "paid") {
+      return sendResponse(res, false, 400, "Paid invoices must be shared as paid confirmations");
+    }
 
-    const phone = String(invoice.phoneNumber || "").trim();
-    if (!phone) {
-      return sendResponse(res, false, 400, "External invoice has no phone number");
-    }
-    // Guard against placeholder numbers used during import.
-    // Allow bypass only when a test override is configured.
-    if (phone === "9613000000" && String(process.env.WHATSAPP_OVERRIDE_TO || "").trim().length === 0) {
-      return sendResponse(
-        res,
-        false,
-        400,
-        "External invoice phoneNumber is a placeholder (9613000000). Update the invoice phoneNumber or set WHATSAPP_OVERRIDE_TO for testing."
-      );
-    }
+    const phone = await resolveExternalInvoicePhone(invoice);
+    const phoneError = validateWhatsAppPhone(phone);
+    if (phoneError) return sendResponse(res, false, 400, phoneError);
 
     let checkoutUrl: string | null = null;
     try {
@@ -1258,6 +1312,70 @@ export const remindExternalInvoiceHandler = async (req: Request, res: Response) 
   } catch (error: any) {
     console.error("Error sending external invoice reminder:", error);
     return sendResponse(res, false, 500, error?.message || "Failed to send reminder");
+  }
+};
+
+export const sharePaidExternalInvoiceHandler = async (req: Request, res: Response) => {
+  try {
+    const invoiceId = parseInt(req.params.invoiceId, 10);
+    if (!Number.isFinite(invoiceId) || invoiceId <= 0) {
+      return sendResponse(res, false, 400, "Invalid invoice ID");
+    }
+
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const invoice = await repo.findOne({ where: { id: invoiceId } });
+    if (!invoice) {
+      return sendResponse(res, false, 404, "External invoice not found");
+    }
+    if (invoice.voidedAt || invoice.documentType === "credit_note") {
+      return sendResponse(res, false, 400, "Credit notes cannot be shared as paid invoices");
+    }
+    if (String(invoice.status).toLowerCase() !== "paid") {
+      return sendResponse(res, false, 400, "Only paid invoices can be shared");
+    }
+
+    const phone = await resolveExternalInvoicePhone(invoice);
+    const phoneError = validateWhatsAppPhone(phone);
+    if (phoneError) return sendResponse(res, false, 400, phoneError);
+
+    const amount = Number(invoice.totalAmount ?? invoice.amount ?? 0);
+    const result = await sendWhatsAppMessageStrict({
+      to: phone,
+      message: composePaidMessage({
+        fullName: invoice.fullName,
+        username: invoice.username,
+        invoiceId: invoice.id,
+        amount,
+      }),
+      templateKind: "payment",
+      templateVariables: buildPaymentTemplateVariables({
+        fullName: invoice.fullName,
+        username: invoice.username,
+        invoiceId: invoice.id,
+        amount,
+      }),
+    });
+
+    const actor = req.user?.username || "system";
+    const sentAt = new Date();
+    const lastAction = `paid invoice shared by ${actor} via WhatsApp @ ${sentAt.toISOString()}`;
+    await repo.update({ id: invoiceId }, { lastAction });
+    await invoiceEvents.emitModification({
+      invoiceId,
+      username: actor,
+      action: "UPDATED",
+      timestamp: sentAt,
+      changes: { paidInvoiceShared: true, channel: "whatsapp" },
+      data: { persistLastAction: lastAction },
+    });
+
+    return sendResponse(res, true, 200, "Paid invoice shared on WhatsApp", {
+      ok: true,
+      ...result,
+    });
+  } catch (error: any) {
+    console.error("Error sharing paid invoice on WhatsApp:", error);
+    return sendResponse(res, false, 500, error?.message || "Failed to share paid invoice");
   }
 };
 

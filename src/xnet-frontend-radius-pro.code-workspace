@@ -26,6 +26,9 @@
         },
         {
             "path": "../../market-pulse"
+        },
+        {
+            "path": "../../recharge-platform"
         }
     ]
 }
