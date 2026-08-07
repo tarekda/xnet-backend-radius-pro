@@ -1,11 +1,15 @@
-import { mapMyISPRows, parseMyISPCsv } from '../myispInvoiceService';
+import {
+  mapMyISPProviderMacRows,
+  mapMyISPRows,
+  parseMyISPCsv,
+} from '../myispInvoiceService';
 
 describe('MyISP invoice CSV mapping', () => {
   it('parses UTF-8 CSV with quoted commas and embedded newlines', () => {
     const csv = [
-      '\uFEFFusername,userfname,userlname,email,mobile,phone,address,address2,building,sellingprice,planname,expirydate,password',
+      '\uFEFFusername,userfname,userlname,email,mobile,phone,address,address2,building,staticip,sellingprice,planname,expirydate,password',
       'alice,"Alice, Marie",Smith,alice@example.com,70123456,01123456,"Main Street',
-      'Apartment 4",Beirut,Blue Tower,45.50,Fiber Gold,2099-07-31,do-not-import',
+      'Apartment 4",Beirut,Blue Tower,"10.0.0.4 / aa-bb-cc-dd-ee-ff",45.50,Fiber Gold,2099-07-31,do-not-import',
     ].join('\n');
 
     const parsed = parseMyISPCsv(Buffer.from(csv, 'utf8'));
@@ -28,6 +32,7 @@ describe('MyISP invoice CSV mapping', () => {
       phoneNumber: '70123456',
       address: 'Main Street\nApartment 4 Beirut Blue Tower',
       provider: 'myisp',
+      providerMacAddress: 'AA:BB:CC:DD:EE:FF',
       amount: 45.5,
       billingMonth: '2026-07-01',
       status: 'pending',
@@ -68,5 +73,35 @@ describe('MyISP invoice CSV mapping', () => {
         expect.objectContaining({ row: 4, field: 'blockuser', severity: 'warning' }),
       ])
     );
+  });
+
+  it('uses MAC addresses loaded from the MyISP users page when the CSV IP is empty', () => {
+    const result = mapMyISPRows(
+      [{ username: 'alice', staticip: '', sellingprice: '20', expirydate: '2099-08-31' }],
+      ['username', 'staticip', 'sellingprice', 'expirydate'],
+      '2026-08-01',
+      'admin',
+      'myisp2',
+      new Map([['alice', 'AA:BB:CC:DD:EE:FF']])
+    );
+
+    expect(result.invoices[0]).toMatchObject({
+      username: 'alice',
+      provider: 'myisp2',
+      providerMacAddress: 'AA:BB:CC:DD:EE:FF',
+    });
+  });
+
+  it('reads macAddress when the MyISP page also returns an empty staticip field', () => {
+    const macs = mapMyISPProviderMacRows([
+      {
+        username: '<b>Alice</b>',
+        staticip: null,
+        framedipaddress: '100.64.0.1',
+        macAddress: '68-ff-7b-4b-f8-2d',
+      },
+    ]);
+
+    expect(macs.get('alice')).toBe('68:FF:7B:4B:F8:2D');
   });
 });

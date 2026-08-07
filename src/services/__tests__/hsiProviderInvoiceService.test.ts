@@ -1,5 +1,9 @@
 import * as XLSX from 'xlsx';
-import { mapHsiRows, parseHsiWorkbook } from '../hsiProviderInvoiceService';
+import {
+  mapHsiProviderMacRows,
+  mapHsiRows,
+  parseHsiWorkbook,
+} from '../hsiProviderInvoiceService';
 
 describe('IDM/Terra invoice export mapping', () => {
   it('maps the shared HSI workbook schema and excludes passwords from preview', () => {
@@ -13,6 +17,7 @@ describe('IDM/Terra invoice export mapping', () => {
         Expiry: '2099-07-31',
         Service: 'Fiber Gold',
         Price: '$45.50',
+        'Mac Address': 'aabb.ccdd.eeff',
       },
     ]);
     const workbook = XLSX.utils.book_new();
@@ -27,6 +32,7 @@ describe('IDM/Terra invoice export mapping', () => {
       fullName: 'Alice Example',
       phoneNumber: '70123456',
       provider: 'idm',
+      providerMacAddress: 'AA:BB:CC:DD:EE:FF',
       amount: 45.5,
       payDueDate: '2099-07-31',
       billingMonth: '2026-07-01',
@@ -65,5 +71,15 @@ describe('IDM/Terra invoice export mapping', () => {
 
     expect(mapHsiRows('terra', rows, ['Username', 'Price', 'Expiry'], '2026-07-01').invoices).toHaveLength(1);
     expect(mapHsiRows('idm', rows, ['Username', 'Price', 'Expiry'], '2026-07-01').invoices).toHaveLength(0);
+  });
+
+  it('maps MAC addresses from the authenticated active-user API', () => {
+    const macs = mapHsiProviderMacRows([
+      { username: 'Alice', macaddr: '68:ff:7b:4b:f8:2d' },
+      { username: 'missing', macaddr: 'N/A' },
+    ]);
+
+    expect(macs.get('alice')).toBe('68:FF:7B:4B:F8:2D');
+    expect(macs.has('missing')).toBe(false);
   });
 });

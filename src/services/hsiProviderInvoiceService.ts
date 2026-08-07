@@ -5,6 +5,7 @@ import { AppError } from '../errors/AppError';
 import type { ImportPreviewIssue, ImportPreviewResult } from './externalInvoiceImportParser';
 import { parsePayDueValue } from './externalInvoiceImportParser';
 import { normalizeDebitLabel } from './invoiceService';
+import { extractMacAddress } from '../utils/macAddress';
 
 export type HsiProvider = 'idm' | 'terra';
 
@@ -16,6 +17,11 @@ type HsiConfig = {
 };
 
 type HsiRow = Record<string, unknown>;
+
+type HsiExport = {
+  workbook: Buffer;
+  providerMacByUsername: Map<string, string>;
+};
 
 export type HsiInvoiceResult = {
   invoices: Partial<ExternalInvoice>[];
@@ -41,6 +47,10 @@ class CookieJar {
   header(): string | undefined {
     if (!this.values.size) return undefined;
     return [...this.values].map(([name, value]) => `${name}=${value}`).join('; ');
+  }
+
+  get(name: string): string | undefined {
+    return this.values.get(name);
   }
 }
 
@@ -96,7 +106,50 @@ async function request(
   return response;
 }
 
-async function fetchExport(provider: HsiProvider): Promise<Buffer> {
+export function mapHsiProviderMacRows(rows: unknown[]): Map<string, string> {
+  const result = new Map<string, string>();
+  for (const item of rows) {
+    if (!item || typeof item !== 'object') continue;
+    const row = item as Record<string, unknown>;
+    const username = text(row.username).toLowerCase();
+    const mac = extractMacAddress(row.macaddr ?? row.macAddress ?? row['Mac Address']);
+    if (username && mac) result.set(username, mac);
+  }
+  return result;
+}
+
+async function fetchProviderMacMap(
+  client: AxiosInstance,
+  jar: CookieJar,
+  config: HsiConfig
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const pageSize = 500;
+  for (let pageIndex = 1; pageIndex <= 200; pageIndex += 1) {
+    const response = await request(client, jar, {
+      method: 'get',
+      url: '/api/user/list/',
+      params: { pageIndex, pageSize, status: 3 },
+      headers: {
+        'X-CSRFToken': jar.get('csrftoken') || '',
+        Referer: `${config.baseUrl}/user/list/`,
+      },
+    });
+    if (response.status !== 200) break;
+    const payload =
+      typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+    const rows = Array.isArray(payload?.data) ? payload.data : [];
+    for (const [username, mac] of mapHsiProviderMacRows(rows)) {
+      result.set(username, mac);
+    }
+    const total = Number(payload?.itemscount);
+    if (!rows.length || rows.length < pageSize) break;
+    if (Number.isFinite(total) && pageIndex * pageSize >= total) break;
+  }
+  return result;
+}
+
+async function fetchExport(provider: HsiProvider): Promise<HsiExport> {
   const config = loadConfig(provider);
   const client = axios.create({
     baseURL: config.baseUrl,
@@ -137,6 +190,13 @@ async function fetchExport(provider: HsiProvider): Promise<Buffer> {
       throw new AppError(`${prefix} authentication failed`, 502, `${prefix}_AUTH_FAILED`, true);
     }
 
+    let providerMacByUsername = new Map<string, string>();
+    try {
+      providerMacByUsername = await fetchProviderMacMap(client, jar, config);
+    } catch {
+      // Live-list MAC enrichment is best-effort and must not block invoice imports.
+    }
+
     const exported = await request(client, jar, {
       method: 'get',
       url: '/user/list/download',
@@ -151,7 +211,10 @@ async function fetchExport(provider: HsiProvider): Promise<Buffer> {
     if (!contentType.includes('spreadsheetml')) {
       throw new AppError(`${prefix} returned an unexpected export format`, 502, `${prefix}_INVALID_EXPORT`, true);
     }
-    return Buffer.from(exported.data);
+    return {
+      workbook: Buffer.from(exported.data),
+      providerMacByUsername,
+    };
   } catch (error) {
     if (error instanceof AppError) throw error;
     if (isAxiosError(error) && error.code === 'ECONNABORTED') {
@@ -202,7 +265,8 @@ export function mapHsiRows(
   rows: HsiRow[],
   headers: string[],
   billingMonth: string,
-  actorUsername?: string
+  actorUsername?: string,
+  providerMacByUsername = new Map<string, string>()
 ): HsiInvoiceResult {
   const invoices: Partial<ExternalInvoice>[] = [];
   const issues: ImportPreviewIssue[] = [];
@@ -251,6 +315,10 @@ export function mapHsiRows(
       phoneNumber: text(field(row, 'Mobile')),
       address: text(field(row, 'Address')) || null,
       provider,
+      providerMacAddress:
+        extractMacAddress(field(row, 'Mac Address')) ||
+        providerMacByUsername.get(username.toLowerCase()) ||
+        null,
       amount,
       payDueDate: expiryDate,
       billingMonth,
@@ -284,7 +352,22 @@ export async function fetchHsiProviderInvoices(
   billingMonth: string,
   actorUsername?: string
 ): Promise<HsiInvoiceResult> {
-  const workbook = await fetchExport(provider);
+  const { workbook, providerMacByUsername } = await fetchExport(provider);
   const { headers, rows } = parseHsiWorkbook(workbook);
-  return mapHsiRows(provider, rows, headers, billingMonth, actorUsername);
+  return mapHsiRows(
+    provider,
+    rows,
+    headers,
+    billingMonth,
+    actorUsername,
+    providerMacByUsername
+  );
+}
+
+/** Fetch live Username → MAC values without importing or altering invoices. */
+export async function fetchHsiProviderMacAddresses(
+  provider: HsiProvider
+): Promise<Map<string, string>> {
+  const { providerMacByUsername } = await fetchExport(provider);
+  return providerMacByUsername;
 }

@@ -49,6 +49,11 @@ import type { ImportPreviewResult } from "../services/externalInvoiceImportParse
 import { fetchMyISPInvoices } from "../services/myispInvoiceService";
 import { fetchActiveRadiusInvoices } from "../services/radiusInvoiceImportService";
 import { fetchHsiProviderInvoices, HsiProvider } from "../services/hsiProviderInvoiceService";
+import {
+  getInvoiceProvidersForMonth,
+  getProviderMacList,
+  syncProviderMacAddresses,
+} from "../services/providerMacService";
 
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
   res.status(status).json({ success, message, data });
@@ -981,6 +986,60 @@ export const getExternalInvoicePaymentLinesHandler = async (req: Request, res: R
   } catch (error) {
     console.error("Error fetching payment lines:", error);
     res.status(500).json({ message: "Failed to fetch payment lines" });
+  }
+};
+
+export const getProviderMacOptionsHandler = async (req: Request, res: Response) => {
+  try {
+    const billingMonth = String(req.query.billingMonth || "").trim();
+    const providers = await getInvoiceProvidersForMonth(billingMonth);
+    return sendResponse(res, true, 200, "Invoice providers fetched", providers);
+  } catch (error: any) {
+    const message = String(error?.message || "Failed to fetch providers");
+    if (message.includes("Billing month")) {
+      return sendResponse(res, false, 400, message);
+    }
+    console.error("Error fetching invoice providers:", error);
+    return sendResponse(res, false, 500, "Failed to fetch providers");
+  }
+};
+
+export const getProviderMacListHandler = async (req: Request, res: Response) => {
+  try {
+    const provider = String(req.query.provider || "").trim();
+    const billingMonth = String(req.query.billingMonth || "").trim();
+    const result = await getProviderMacList(provider, billingMonth);
+    return sendResponse(res, true, 200, "Provider MAC addresses fetched", result);
+  } catch (error: any) {
+    const message = String(error?.message || "Failed to fetch provider MAC addresses");
+    if (
+      message === "Provider is required" ||
+      message === "Provider is invalid" ||
+      message.includes("Billing month")
+    ) {
+      return sendResponse(res, false, 400, message);
+    }
+    console.error("Error fetching provider MAC addresses:", error);
+    return sendResponse(res, false, 500, "Failed to fetch provider MAC addresses");
+  }
+};
+
+export const syncProviderMacAddressesHandler = async (req: Request, res: Response) => {
+  try {
+    const provider = String(req.body?.provider || "").trim();
+    const billingMonth = String(req.body?.billingMonth || "").trim();
+    const result = await syncProviderMacAddresses(provider, billingMonth);
+    return sendResponse(res, true, 200, "Provider MAC addresses synchronized", result);
+  } catch (error: any) {
+    const message = String(error?.message || "Failed to synchronize provider MAC addresses");
+    if (
+      message.includes("Billing month") ||
+      message === "Live MAC sync is unavailable for this provider"
+    ) {
+      return sendResponse(res, false, 400, message);
+    }
+    console.error("Error synchronizing provider MAC addresses:", error);
+    return sendResponse(res, false, 500, "Failed to synchronize provider MAC addresses");
   }
 };
 

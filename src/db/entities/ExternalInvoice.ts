@@ -112,6 +112,10 @@ export class ExternalInvoice {
   @Column("varchar", { name: "provider", length: 10 })
   provider: string;
 
+  /** MAC supplied by the upstream provider export, when available. */
+  @Column("varchar", { name: "provider_mac_address", nullable: true, length: 17 })
+  providerMacAddress: string | null;
+
   /** Optional line label for multiple charges per user/month (e.g. carryover, second debit). Empty = primary line. */
   @Column("varchar", { name: "debitLabel", length: 64, default: () => "''" })
   debitLabel: string;

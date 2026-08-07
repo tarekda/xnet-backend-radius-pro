@@ -12,6 +12,7 @@ import type {
   ImportPreviewResult,
 } from './externalInvoiceImportParser';
 import { normalizeDebitLabel } from './invoiceService';
+import { extractMacAddress } from '../utils/macAddress';
 
 type MyISPRow = Record<string, unknown>;
 export type MyISPAccount = 1 | 2;
@@ -27,6 +28,11 @@ type MyISPConfig = {
   password: string;
   resellerId?: string;
   timeoutMs: number;
+};
+
+type MyISPExport = {
+  csv: Buffer;
+  providerMacByUsername: Map<string, string>;
 };
 
 function normalizeCell(value: unknown): string | null {
@@ -143,6 +149,143 @@ function extractResellerId(html: string): string | null {
   }
 }
 
+function extractPageCsrfToken(html: string): string | null {
+  return (
+    /<meta\s+name=["']csrf-token["']\s+content=["']([^"']+)/i.exec(html)?.[1] ||
+    /<meta\s+content=["']([^"']+)["']\s+name=["']csrf-token["']/i.exec(html)?.[1] ||
+    extractCsrfToken(html)
+  );
+}
+
+function stripHtml(value: unknown): string {
+  return String(value ?? "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;|&#160;/gi, " ")
+    .replace(/&colon;/gi, ":")
+    .replace(/&#58;/gi, ":")
+    .replace(/&hyphen;|&#45;/gi, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function dataTableForm(start: number, length: number): URLSearchParams {
+  const form = new URLSearchParams({
+    draw: String(Math.floor(start / length) + 1),
+    start: String(start),
+    length: String(length),
+    "search[value]": "",
+    "search[regex]": "false",
+    "order[0][column]": "3",
+    "order[0][dir]": "asc",
+  });
+  for (let index = 0; index < 35; index += 1) {
+    form.set(`columns[${index}][data]`, String(index));
+    form.set(`columns[${index}][name]`, "");
+    form.set(`columns[${index}][searchable]`, "true");
+    form.set(`columns[${index}][orderable]`, "true");
+    form.set(`columns[${index}][search][value]`, "");
+    form.set(`columns[${index}][search][regex]`, "false");
+  }
+  // The upstream builds `ORDER BY A.<column data>` directly. Its browser sends
+  // numeric data values, which produce invalid SQL; use the real DB field.
+  form.set("columns[3][data]", "username");
+  return form;
+}
+
+function dataTableRows(payload: any): unknown[] {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.aaData)) return payload.aaData;
+  return [];
+}
+
+function rowValue(row: unknown, arrayIndex: number, objectKeys: string[]): unknown {
+  if (Array.isArray(row)) return row[arrayIndex];
+  if (!row || typeof row !== "object") return undefined;
+  const record = row as Record<string, unknown>;
+  for (const key of objectKeys) {
+    if (
+      record[key] !== undefined &&
+      record[key] !== null &&
+      String(record[key]).trim() !== ""
+    ) {
+      return record[key];
+    }
+    const matchingKey = Object.keys(record).find(
+      (candidate) => normalizeHeader(candidate) === normalizeHeader(key)
+    );
+    if (
+      matchingKey &&
+      record[matchingKey] !== null &&
+      String(record[matchingKey]).trim() !== ""
+    ) {
+      return record[matchingKey];
+    }
+  }
+  return record[String(arrayIndex)];
+}
+
+export function mapMyISPProviderMacRows(rows: unknown[]): Map<string, string> {
+  const result = new Map<string, string>();
+  for (const row of rows) {
+    const username = stripHtml(
+      rowValue(row, 3, ["username", "userName", "user_username"])
+    ).toLowerCase();
+    const mac = extractMacAddress(
+      stripHtml(rowValue(row, 7, ["ip", "staticip", "staticIp", "mac", "macAddress"]))
+    );
+    if (username && mac) result.set(username, mac);
+  }
+  return result;
+}
+
+async function fetchProviderMacMap(
+  client: AxiosInstance,
+  jar: CookieJar,
+  config: MyISPConfig,
+  usersHtml: string
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const csrfToken = extractPageCsrfToken(usersHtml);
+  if (!csrfToken) return result;
+
+  const pageSize = 500;
+  for (let start = 0; start < 100_000; start += pageSize) {
+    const response = await requestWithCookies(client, jar, {
+      method: "post",
+      url: "/admingetresellerusers.php",
+      data: dataTableForm(start, pageSize).toString(),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-CSRF-Token": csrfToken,
+        Origin: new URL(config.baseUrl).origin,
+        Referer: `${config.baseUrl}/resellerUsers.php`,
+      },
+    });
+    if (response.status < 200 || response.status >= 300) break;
+
+    let payload: any;
+    try {
+      payload =
+        typeof response.data === "string" ? JSON.parse(response.data) : response.data;
+    } catch {
+      break;
+    }
+    if (payload?.redirect || payload?.error) break;
+
+    const rows = dataTableRows(payload);
+    for (const [username, mac] of mapMyISPProviderMacRows(rows)) {
+      result.set(username, mac);
+    }
+
+    const total = Number(payload?.recordsFiltered ?? payload?.recordsTotal);
+    if (rows.length === 0 || rows.length < pageSize) break;
+    if (Number.isFinite(total) && start + rows.length >= total) break;
+  }
+  return result;
+}
+
 async function requestWithCookies(
   client: AxiosInstance,
   jar: CookieJar,
@@ -206,7 +349,7 @@ function assertSuccessful(response: AxiosResponse, operation: string): void {
   }
 }
 
-async function fetchAuthenticatedExport(account: MyISPAccount): Promise<Buffer> {
+async function fetchAuthenticatedExport(account: MyISPAccount): Promise<MyISPExport> {
   const config = loadConfig(account);
   const client = axios.create({
     baseURL: config.baseUrl,
@@ -298,6 +441,13 @@ async function fetchAuthenticatedExport(account: MyISPAccount): Promise<Buffer> 
       );
     }
 
+    let providerMacByUsername = new Map<string, string>();
+    try {
+      providerMacByUsername = await fetchProviderMacMap(client, jar, config, usersHtml);
+    } catch {
+      // MAC enrichment is best-effort and must not block the invoice import.
+    }
+
     const exportResponse = await requestWithCookies(client, jar, {
       method: 'get',
       url: '/export-users.php',
@@ -317,7 +467,10 @@ async function fetchAuthenticatedExport(account: MyISPAccount): Promise<Buffer> 
         true
       );
     }
-    return Buffer.from(exportResponse.data);
+    return {
+      csv: Buffer.from(exportResponse.data),
+      providerMacByUsername,
+    };
   } catch (error) {
     if (error instanceof AppError) throw error;
     if (isAxiosError(error) && error.code === 'ECONNABORTED') {
@@ -371,7 +524,8 @@ export function mapMyISPRows(
   headers: string[],
   billingMonth: string,
   actorUsername?: string,
-  provider = 'myisp'
+  provider = 'myisp',
+  providerMacByUsername = new Map<string, string>()
 ): MyISPMappingResult {
   const safeHeaders = headers.filter(
     (header) => !normalizeHeader(header).includes('password')
@@ -439,6 +593,10 @@ export function mapMyISPRows(
       phoneNumber: mobile || phone || '',
       address: address || null,
       provider,
+      providerMacAddress:
+        extractMacAddress(readField(row, ['staticip', 'ip'])) ||
+        providerMacByUsername.get(username.toLowerCase()) ||
+        null,
       amount,
       payDueDate: expiryDate,
       billingMonth,
@@ -473,13 +631,22 @@ export async function fetchMyISPInvoices(
   actorUsername?: string,
   account: MyISPAccount = 1
 ): Promise<MyISPMappingResult> {
-  const csv = await fetchAuthenticatedExport(account);
+  const { csv, providerMacByUsername } = await fetchAuthenticatedExport(account);
   const { headers, rows } = parseMyISPCsv(csv);
   return mapMyISPRows(
     rows,
     headers,
     billingMonth,
     actorUsername,
-    account === 1 ? 'myisp' : 'myisp2'
+    account === 1 ? 'myisp' : 'myisp2',
+    providerMacByUsername
   );
+}
+
+/** Fetch only the live Username → MAC mapping; does not import or alter invoices. */
+export async function fetchMyISPProviderMacAddresses(
+  account: MyISPAccount = 1
+): Promise<Map<string, string>> {
+  const { providerMacByUsername } = await fetchAuthenticatedExport(account);
+  return providerMacByUsername;
 }

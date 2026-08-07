@@ -46,6 +46,8 @@ export const getLiveSessionDetail = async (req: Request, res: Response) => {
       .createQueryBuilder("session")
       .leftJoin(Raduserprofile, "userProfile", "session.username = userProfile.username")
       .leftJoin(Radprofile, "profile", "userProfile.profile_id = profile.id")
+      .leftJoin("user_default_profiles", "udp", "udp.username = session.username")
+      .leftJoin(Radprofile, "defaultProfile", "defaultProfile.id = udp.default_profile_id")
       .leftJoin(UserDetails, "userDetails", "session.username = userDetails.username")
       .leftJoin(
         Radacct,
@@ -68,9 +70,18 @@ export const getLiveSessionDetail = async (req: Request, res: Response) => {
         "COALESCE(raLive.acctupdatetime, NULL) AS acctUpdateTime",
         "COALESCE(raLive.acctinputoctets, 0) AS totalBytesIn",
         "COALESCE(raLive.acctoutputoctets, 0) AS totalBytesOut",
-        "profile.profile_name AS profileName",
-        "profile.daily_quota AS dailyQuota",
-        "profile.monthly_quota AS monthlyQuota",
+        "profile.profileName AS profileName",
+        "COALESCE(defaultProfile.profileName, profile.profileName) AS originalProfileName",
+        `CASE
+           WHEN LOWER(COALESCE(profile.profile_name, '')) = 'fallback' AND defaultProfile.daily_quota IS NOT NULL
+             THEN defaultProfile.daily_quota
+           ELSE profile.daily_quota
+         END AS dailyQuota`,
+        `CASE
+           WHEN LOWER(COALESCE(profile.profile_name, '')) = 'fallback' AND defaultProfile.monthly_quota IS NOT NULL
+             THEN defaultProfile.monthly_quota
+           ELSE profile.monthly_quota
+         END AS monthlyQuota`,
         "COALESCE(userProfile.is_fallback, 0) AS isFallback",
         "userDetails.fullName AS fullName",
       ])
@@ -251,6 +262,9 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
       )
       .leftJoin(Raduserprofile, "userProfile", "ra.username = userProfile.username")
       .leftJoin(Radprofile, "profile", "userProfile.profileId = profile.id")
+      // Original plan saved when RADIUS moves the user onto Fallback (FUP).
+      .leftJoin("user_default_profiles", "udp", "udp.username = ra.username")
+      .leftJoin(Radprofile, "defaultProfile", "defaultProfile.id = udp.default_profile_id")
       .leftJoin(Nas, "nas", "nas.nasname = ra.nasipaddress")
       .leftJoinAndMapOne(
         "user.userDetails",
@@ -278,12 +292,39 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
         "monthlyUsage.quota_reset_day AS quota_reset_day",
         "monthlyUsage.quota_cycle_start_date AS quota_cycle_start_date",
         "monthlyUsage.is_monthly_exceeded AS is_monthly_exceeded",
+        // Current RADIUS profile (often "Fallback" while FUP)
         "profile.profileName AS profile_profile_name",
-        "profile.dailyQuota AS profile_daily_quota",
-        "profile.monthlyQuota AS profile_monthly_quota",
+        // Original plan name for UI when current profile is Fallback
+        "COALESCE(defaultProfile.profileName, profile.profileName) AS original_profile_name",
+        // Consumption bars must use the original plan quotas, not Fallback's tiny/wrong limits.
+        // Use DB column names inside raw CASE (TypeORM does not remap camelCase in template SQL).
+        `CASE
+           WHEN LOWER(COALESCE(profile.profile_name, '')) = 'fallback' AND defaultProfile.daily_quota IS NOT NULL
+             THEN defaultProfile.daily_quota
+           ELSE profile.daily_quota
+         END AS profile_daily_quota`,
+        `CASE
+           WHEN LOWER(COALESCE(profile.profile_name, '')) = 'fallback' AND defaultProfile.monthly_quota IS NOT NULL
+             THEN defaultProfile.monthly_quota
+           ELSE profile.monthly_quota
+         END AS profile_monthly_quota`,
         "COALESCE(userProfile.is_fallback, 0) AS is_fallback",
-        "GREATEST(profile.dailyQuota - COALESCE(usage.data_usage, 0), 0) AS remaining_daily_quota",
-        "GREATEST(profile.monthlyQuota - COALESCE(monthlyUsage.monthly_usage, 0), 0) AS remaining_monthly_quota",
+        `GREATEST(
+           CASE
+             WHEN LOWER(COALESCE(profile.profile_name, '')) = 'fallback' AND defaultProfile.daily_quota IS NOT NULL
+               THEN defaultProfile.daily_quota
+             ELSE profile.daily_quota
+           END - COALESCE(usage.data_usage, 0),
+           0
+         ) AS remaining_daily_quota`,
+        `GREATEST(
+           CASE
+             WHEN LOWER(COALESCE(profile.profile_name, '')) = 'fallback' AND defaultProfile.monthly_quota IS NOT NULL
+               THEN defaultProfile.monthly_quota
+             ELSE profile.monthly_quota
+           END - COALESCE(monthlyUsage.monthly_usage, 0),
+           0
+         ) AS remaining_monthly_quota`,
         "userDetails.fullName AS userDetails_full_name",
       ])
       .where(sqlRadacctIsOnline("ra"))
@@ -303,7 +344,8 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
         usage.data_usage, monthlyUsage.monthly_usage, monthlyUsage.monthly_cycle_start, monthlyUsage.monthly_cycle_reset_at,
         monthlyUsage.quota_reset_day, monthlyUsage.quota_cycle_start_date, monthlyUsage.is_monthly_exceeded,
         dailyUsage.daily_usage,
-        profile.profileName, profile.dailyQuota, profile.monthlyQuota, userProfile.is_fallback,
+        profile.profile_name, profile.daily_quota, profile.monthly_quota, userProfile.is_fallback,
+        defaultProfile.profile_name, defaultProfile.daily_quota, defaultProfile.monthly_quota,
         ra.nasipaddress, nas.shortname, nas.nasname,
         userDetails.fullName`)
       .orderBy(sqlRadacctLastUpdate("ra"), "DESC")

@@ -1,6 +1,6 @@
 // src/routes/invoice.routes.ts
 import { Router } from "express";
-import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceByIdHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, sharePaidExternalInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler, previewMyISPInvoicesHandler, importMyISPInvoicesHandler, previewMyISP2InvoicesHandler, importMyISP2InvoicesHandler, previewRadiusInvoicesHandler, importRadiusInvoicesHandler, previewIDMInvoicesHandler, importIDMInvoicesHandler, previewTerraInvoicesHandler, importTerraInvoicesHandler } from "../controllers/invoiceController";
+import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceByIdHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, getProviderMacListHandler, getProviderMacOptionsHandler, syncProviderMacAddressesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, sharePaidExternalInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler, previewMyISPInvoicesHandler, importMyISPInvoicesHandler, previewMyISP2InvoicesHandler, importMyISP2InvoicesHandler, previewRadiusInvoicesHandler, importRadiusInvoicesHandler, previewIDMInvoicesHandler, importIDMInvoicesHandler, previewTerraInvoicesHandler, importTerraInvoicesHandler } from "../controllers/invoiceController";
 import {
   dismissWhatsappPaymentAmbiguityHandler,
   listWhatsappPaymentAmbiguitiesHandler,
@@ -120,6 +120,27 @@ router.get(
     "billing.externalInvoices.unpay"
   ),
   getExternalInvoicesPaymentDueHandler
+);
+router.get(
+  "/external/provider-macs/providers",
+  authenticateToken,
+  authorizePermissions("billing.invoiceUpload.create"),
+  authorizePermissions("users.view"),
+  getProviderMacOptionsHandler
+);
+router.get(
+  "/external/provider-macs",
+  authenticateToken,
+  authorizePermissions("billing.invoiceUpload.create"),
+  authorizePermissions("users.view"),
+  getProviderMacListHandler
+);
+router.post(
+  "/external/provider-macs/sync",
+  authenticateToken,
+  authorizePermissions("billing.invoiceUpload.create"),
+  authorizePermissions("users.view"),
+  syncProviderMacAddressesHandler
 );
 router.get(
   "/external/whatsapp-payment-ambiguities",
