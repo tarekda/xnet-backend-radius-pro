@@ -2,6 +2,7 @@ import * as XLSX from 'xlsx';
 import {
   mapHsiProviderMacRows,
   mapHsiRows,
+  mergeHsiWorkbookMacAddresses,
   parseHsiWorkbook,
 } from '../hsiProviderInvoiceService';
 
@@ -77,9 +78,24 @@ describe('IDM/Terra invoice export mapping', () => {
     const macs = mapHsiProviderMacRows([
       { username: 'Alice', macaddr: '68:ff:7b:4b:f8:2d' },
       { username: 'missing', macaddr: 'N/A' },
+      { Username: 'bob', 'Mac Address': 'aa bb cc dd ee ff' },
     ]);
 
     expect(macs.get('alice')).toBe('68:FF:7B:4B:F8:2D');
     expect(macs.has('missing')).toBe(false);
+    expect(macs.get('bob')).toBe('AA:BB:CC:DD:EE:FF');
+  });
+
+  it('fills MAC gaps from the active-user workbook export', () => {
+    const fromApi = new Map([['alice', '11:22:33:44:55:66']]);
+    mergeHsiWorkbookMacAddresses(fromApi, [
+      { Username: 'alice', 'Mac Address': 'aa:bb:cc:dd:ee:ff' },
+      { Username: 'carol', 'Mac Address': 'aabb.ccdd.eeff' },
+      { Username: 'dave', 'Mac Address': '' },
+    ]);
+
+    expect(fromApi.get('alice')).toBe('11:22:33:44:55:66');
+    expect(fromApi.get('carol')).toBe('AA:BB:CC:DD:EE:FF');
+    expect(fromApi.has('dave')).toBe(false);
   });
 });

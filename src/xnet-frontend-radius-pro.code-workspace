@@ -29,6 +29,9 @@
         },
         {
             "path": "../../recharge-platform"
+        },
+        {
+            "path": "../../xnet-radius-mobile"
         }
     ]
 }

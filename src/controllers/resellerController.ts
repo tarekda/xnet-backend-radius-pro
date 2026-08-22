@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { DataSource, EntityManager } from "typeorm";
 import { AppDataSource } from "../db/config";
 import { Reseller } from "../db/entities/Reseller";
 import { ResellerLedgerEntry } from "../db/entities/ResellerLedgerEntry";
@@ -9,9 +10,44 @@ import { Radprofile } from "../db/entities/Radprofile";
 import { authorizePermissions } from "../middleware/authMiddleware";
 import { SystemUsers } from "../db/entities/SystemUsers";
 import * as bcrypt from "bcryptjs";
+import { creditCompanyWallet, debitCompanyWallet } from "../services/companyWalletService";
 
 function send(res: Response, success: boolean, status: number, message: string, data?: any) {
   res.status(status).json({ success, message, data });
+}
+
+async function resellerBalance(resellerId: number, manager: EntityManager | DataSource = AppDataSource): Promise<number> {
+  const ledgerRepo = manager.getRepository(ResellerLedgerEntry);
+  const credit = await ledgerRepo
+    .createQueryBuilder("l")
+    .select("COALESCE(SUM(l.amount),0)", "sum")
+    .where("l.reseller_id = :rid", { rid: resellerId })
+    .andWhere("l.entry_type = 'credit'")
+    .getRawOne<{ sum: string }>();
+  const debit = await ledgerRepo
+    .createQueryBuilder("l")
+    .select("COALESCE(SUM(l.amount),0)", "sum")
+    .where("l.reseller_id = :rid", { rid: resellerId })
+    .andWhere("l.entry_type = 'debit'")
+    .getRawOne<{ sum: string }>();
+  return Number(credit?.sum || 0) - Number(debit?.sum || 0);
+}
+
+async function resellerBalancesById(): Promise<Map<number, number>> {
+  const rows = await AppDataSource.getRepository(ResellerLedgerEntry)
+    .createQueryBuilder("l")
+    .select("l.reseller_id", "resellerId")
+    .addSelect(
+      "COALESCE(SUM(CASE WHEN l.entry_type = 'credit' THEN l.amount ELSE -l.amount END), 0)",
+      "balance"
+    )
+    .groupBy("l.reseller_id")
+    .getRawMany<{ resellerId: string; balance: string }>();
+  const map = new Map<number, number>();
+  for (const row of rows) {
+    map.set(Number(row.resellerId), Number(row.balance || 0));
+  }
+  return map;
 }
 
 function requireResellerContext(req: Request): number {
@@ -27,7 +63,14 @@ export const resellerAdminList = [
   async (req: Request, res: Response) => {
     const repo = AppDataSource.getRepository(Reseller);
     const rows = await repo.find({ order: { id: "DESC" } });
-    send(res, true, 200, "Resellers fetched", rows);
+    const balances = await resellerBalancesById();
+    send(
+      res,
+      true,
+      200,
+      "Resellers fetched",
+      rows.map((r) => ({ ...r, balance: balances.get(r.id) ?? 0 }))
+    );
   },
 ];
 
@@ -57,23 +100,99 @@ export const resellerAdminFund = [
     if (!Number.isFinite(resellerId)) return send(res, false, 400, "Invalid reseller id");
     if (!Number.isFinite(amt) || amt <= 0) return send(res, false, 400, "amount must be > 0");
 
-    const resellerRepo = AppDataSource.getRepository(Reseller);
-    const ledgerRepo = AppDataSource.getRepository(ResellerLedgerEntry);
-    const reseller = await resellerRepo.findOne({ where: { id: resellerId } });
-    if (!reseller) return send(res, false, 404, "Reseller not found");
+    try {
+      const result = await AppDataSource.transaction(async (manager) => {
+        const resellerRepo = manager.getRepository(Reseller);
+        const ledgerRepo = manager.getRepository(ResellerLedgerEntry);
+        const reseller = await resellerRepo.findOne({ where: { id: resellerId } });
+        if (!reseller) {
+          throw Object.assign(new Error("Reseller not found"), { status: 404 });
+        }
 
-    const entry = ledgerRepo.create({
-      resellerId,
-      amount: amt.toFixed(2),
-      currency: String(currency || "USD"),
-      entryType: "credit",
-      referenceType: "admin_fund",
-      referenceId: null,
-      note: typeof note === "string" ? note : null,
-      createdBy: (req.user as any)?.id ?? null,
-    });
-    await ledgerRepo.save(entry);
-    send(res, true, 201, "Reseller funded", entry);
+        const refId = `${resellerId}:${Date.now()}`;
+        await debitCompanyWallet({
+          amount: amt,
+          currency: String(currency || "USD"),
+          referenceType: "reseller_fund",
+          referenceId: refId,
+          note: typeof note === "string" && note.trim() ? note : `Fund reseller ${reseller.code}`,
+          createdBy: (req.user as any)?.username || "system",
+          manager,
+        });
+
+        const entry = ledgerRepo.create({
+          resellerId,
+          amount: amt.toFixed(2),
+          currency: String(currency || "USD"),
+          entryType: "credit",
+          referenceType: "admin_fund",
+          referenceId: refId,
+          note: typeof note === "string" ? note : null,
+          createdBy: (req.user as any)?.id ?? null,
+        });
+        await ledgerRepo.save(entry);
+        const balance = await resellerBalance(resellerId, manager);
+        return { entry, balance };
+      });
+      send(res, true, 201, "Reseller funded", result);
+    } catch (e: any) {
+      send(res, false, e?.status && Number.isFinite(e.status) ? e.status : 400, e?.message || "Failed to fund reseller");
+    }
+  },
+];
+
+export const resellerAdminDebit = [
+  authorizePermissions("admin.resellers.fund"),
+  async (req: Request, res: Response) => {
+    const resellerId = Number(req.params.id);
+    const { amount, currency = "USD", note } = req.body ?? {};
+    const amt = Number(amount);
+    if (!Number.isFinite(resellerId)) return send(res, false, 400, "Invalid reseller id");
+    if (!Number.isFinite(amt) || amt <= 0) return send(res, false, 400, "amount must be > 0");
+
+    try {
+      const result = await AppDataSource.transaction(async (manager) => {
+        const resellerRepo = manager.getRepository(Reseller);
+        const ledgerRepo = manager.getRepository(ResellerLedgerEntry);
+        const reseller = await resellerRepo.findOne({ where: { id: resellerId } });
+        if (!reseller) {
+          throw Object.assign(new Error("Reseller not found"), { status: 404 });
+        }
+        const balance = await resellerBalance(resellerId, manager);
+        if (balance + 1e-9 < amt) {
+          throw Object.assign(
+            new Error(`Insufficient reseller balance (have ${balance.toFixed(2)}, need ${amt.toFixed(2)})`),
+            { status: 400 }
+          );
+        }
+        const refId = `${resellerId}:${Date.now()}`;
+        const entry = ledgerRepo.create({
+          resellerId,
+          amount: amt.toFixed(2),
+          currency: String(currency || "USD"),
+          entryType: "debit",
+          referenceType: "admin_debit",
+          referenceId: refId,
+          note: typeof note === "string" ? note : null,
+          createdBy: (req.user as any)?.id ?? null,
+        });
+        await ledgerRepo.save(entry);
+        await creditCompanyWallet({
+          amount: amt,
+          currency: String(currency || "USD"),
+          referenceType: "reseller_debit",
+          referenceId: refId,
+          note: typeof note === "string" && note.trim() ? note : `Debit reseller ${reseller.code}`,
+          createdBy: (req.user as any)?.username || "system",
+          manager,
+        });
+        const nextBalance = await resellerBalance(resellerId, manager);
+        return { entry, balance: nextBalance };
+      });
+      send(res, true, 201, "Reseller wallet debited", result);
+    } catch (e: any) {
+      send(res, false, e?.status && Number.isFinite(e.status) ? e.status : 400, e?.message || "Failed to debit reseller");
+    }
   },
 ];
 

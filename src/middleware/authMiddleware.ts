@@ -4,6 +4,8 @@ import { AppDataSource } from '../db/config';
 import { SystemUsers } from '../db/entities/SystemUsers';
 import { getEffectivePermissionsForUser } from '../access/permissionService';
 import { getJwtSecret } from '../config/requireSecrets';
+import { mfaRequiredForRole } from '../services/mfaService';
+import { isMfaEnrollmentAllowedPath } from './mfaEnrollment';
 
 const jwtSecret = getJwtSecret();
 
@@ -36,6 +38,43 @@ export const authenticateToken = async (req: Request, res: Response, next: NextF
     }
 
     req.user = { id, username: decoded?.username, role, resellerId } as any;
+
+    if (mfaRequiredForRole(role)) {
+      if (!id) {
+        res.status(403).json({
+          success: false,
+          code: "MFA_ENROLLMENT_REQUIRED",
+          message: "MFA enrollment required before using the API",
+        });
+        return;
+      }
+      try {
+        const userRepo = AppDataSource.getRepository(SystemUsers);
+        const dbUser = await userRepo.findOne({
+          where: { id },
+          select: ["id", "mfaEnabled"],
+        });
+        if (!dbUser?.mfaEnabled) {
+          const url = String(req.originalUrl || `${req.baseUrl || ""}${req.path || ""}`);
+          if (!isMfaEnrollmentAllowedPath(req.method, url)) {
+            res.status(403).json({
+              success: false,
+              code: "MFA_ENROLLMENT_REQUIRED",
+              message: "MFA enrollment required before using the API",
+            });
+            return;
+          }
+        }
+      } catch {
+        res.status(403).json({
+          success: false,
+          code: "MFA_ENROLLMENT_REQUIRED",
+          message: "MFA enrollment required before using the API",
+        });
+        return;
+      }
+    }
+
     next();
   } catch (err: any) {
     if (err?.name === 'TokenExpiredError') {

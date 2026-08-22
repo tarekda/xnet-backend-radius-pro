@@ -33,6 +33,9 @@ describe("whatsappPaymentGroupService", () => {
     expect(parsePaymentLineFromPart("طارق دعبول 25")).toEqual({ name: "طارق دعبول", amount: 25 });
     expect(parsePaymentLineFromPart("John Smith 19.5")).toEqual({ name: "John Smith", amount: 19.5 });
     expect(parsePaymentLineFromPart("John Smith")).toEqual({ name: "John Smith", amount: null });
+    expect(parsePaymentLineFromPart("سامر دندش 0$")).toEqual({ name: "سامر دندش", amount: null });
+    expect(parsePaymentLineFromPart("سامر دندش ٠$")).toEqual({ name: "سامر دندش", amount: null });
+    expect(parsePaymentLineFromPart("سامر دندش $0")).toEqual({ name: "سامر دندش", amount: null });
     expect(extractPaymentLinesFromMessage("Ali 10\nBob 20")).toEqual([
       { name: "Ali", amount: 10 },
       { name: "Bob", amount: 20 },
@@ -42,7 +45,10 @@ describe("whatsappPaymentGroupService", () => {
   it("parses Arabic-Indic amount digits", () => {
     expect(parseTrailingPaidAmount("٢٥")).toBe(25);
     expect(parseTrailingPaidAmount("٢٥٫٥")).toBe(25.5);
+    expect(parseTrailingPaidAmount("0$")).toBe(0);
+    expect(parseTrailingPaidAmount("٠$")).toBe(0);
     expect(parsePaymentLineFromPart("طارق دعبول ٢٥")).toEqual({ name: "طارق دعبول", amount: 25 });
+    expect(parsePaymentLineFromPart("سامر دندش 0$")).toEqual({ name: "سامر دندش", amount: null });
   });
 
   it("expands Arabic ة/ه variants for SQL search", () => {

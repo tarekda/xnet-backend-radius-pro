@@ -25,4 +25,12 @@ describe("AppError / coerceToAppError", () => {
     expect(err.statusCode).toBe(500);
     expect(err.expose).toBe(false);
   });
+
+  it("honors explicit 4xx status on thrown errors", () => {
+    const raw = Object.assign(new Error("Insufficient company wallet"), { status: 400 });
+    const err = coerceToAppError(raw);
+    expect(err.statusCode).toBe(400);
+    expect(err.expose).toBe(true);
+    expect(err.message).toBe("Insufficient company wallet");
+  });
 });

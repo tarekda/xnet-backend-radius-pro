@@ -106,16 +106,55 @@ async function request(
   return response;
 }
 
+function rowMacValue(row: Record<string, unknown>): unknown {
+  const preferredKeys = [
+    'macaddr',
+    'macAddress',
+    'mac_address',
+    'Mac Address',
+    'mac',
+    'MAC',
+    'staticip',
+    'staticIp',
+    'ip',
+  ];
+  for (const key of preferredKeys) {
+    if (row[key] !== undefined && row[key] !== null && String(row[key]).trim() !== '') {
+      return row[key];
+    }
+  }
+  const wanted = new Set(preferredKeys.map((key) => normalizedHeader(key)));
+  for (const [key, value] of Object.entries(row)) {
+    if (!wanted.has(normalizedHeader(key))) continue;
+    if (value !== undefined && value !== null && String(value).trim() !== '') return value;
+  }
+  return undefined;
+}
+
 export function mapHsiProviderMacRows(rows: unknown[]): Map<string, string> {
   const result = new Map<string, string>();
   for (const item of rows) {
     if (!item || typeof item !== 'object') continue;
     const row = item as Record<string, unknown>;
-    const username = text(row.username).toLowerCase();
-    const mac = extractMacAddress(row.macaddr ?? row.macAddress ?? row['Mac Address']);
+    const username = text(row.username ?? row.userName ?? row.Username).toLowerCase();
+    const mac = extractMacAddress(rowMacValue(row));
     if (username && mac) result.set(username, mac);
   }
   return result;
+}
+
+/** Fill gaps from the active-user XLSX export (status=3), which often has MACs the JSON list omits. */
+export function mergeHsiWorkbookMacAddresses(
+  target: Map<string, string>,
+  rows: HsiRow[]
+): Map<string, string> {
+  for (const row of rows) {
+    const username = text(field(row, 'Username')).toLowerCase();
+    if (!username || target.has(username)) continue;
+    const mac = extractMacAddress(field(row, 'Mac Address') ?? field(row, 'MAC') ?? field(row, 'mac'));
+    if (mac) target.set(username, mac);
+  }
+  return target;
 }
 
 async function fetchProviderMacMap(
@@ -368,6 +407,7 @@ export async function fetchHsiProviderInvoices(
 export async function fetchHsiProviderMacAddresses(
   provider: HsiProvider
 ): Promise<Map<string, string>> {
-  const { providerMacByUsername } = await fetchExport(provider);
-  return providerMacByUsername;
+  const { workbook, providerMacByUsername } = await fetchExport(provider);
+  const { rows } = parseHsiWorkbook(workbook);
+  return mergeHsiWorkbookMacAddresses(providerMacByUsername, rows);
 }

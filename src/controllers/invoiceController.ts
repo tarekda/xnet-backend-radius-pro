@@ -37,6 +37,7 @@ import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import { invoiceEvents } from "../events/invoiceEvents";
 import eventBus from "../bus/eventBusSingleton";
 import { AppDataSource } from "../db/config";
+import { writeAuditLog } from "../audit/writeAuditLog";
 import { Invoices } from "../db/entities/Invoices";
 import { UserDetails } from "../db/entities/UserDetails";
 import { Raduserprofile } from "../db/entities/Raduserprofile";
@@ -275,6 +276,14 @@ const applyDunningAction = async (params: {
         ...(params.stage.action === "remind" ? { lastRemindedAt: new Date() } : {}),
       }
     );
+    if (params.stage.action === "throttle" || params.stage.action === "suspend") {
+      await writeAuditLog({
+        action: `billing.dunning.${params.stage.action}`,
+        actorUsername: params.actor,
+        targetUsernames: [params.invoice.username],
+        meta: { invoiceId: params.invoice.id, stageDay: params.stage.day },
+      });
+    }
     return { ok: true, status: "sent" };
   } catch (err: any) {
     return { ok: false, status: "failed", reason: String(err?.message || "Action failed") };
@@ -479,6 +488,11 @@ export const payInvoiceHandler = async (req: Request, res: Response) => {
       action: 'PAID',
       timestamp: new Date(),
     });
+    await writeAuditLog({
+      req,
+      action: "billing.invoice.pay",
+      meta: { invoiceId: invoice.id },
+    });
 
     sendResponse(res, true, 200, "Invoice paid successfully", invoice);
 
@@ -527,6 +541,11 @@ export const bulkPayInvoicesHandler = async (req: Request, res: Response) => {
     }
 
     const invoices = await bulkPayInvoices(invoiceIds);
+    await writeAuditLog({
+      req,
+      action: "billing.invoice.bulkPay",
+      meta: { invoiceIds },
+    });
     sendResponse(res, true, 200, "Invoices paid successfully", invoices);
   } catch (error) {
     return sendCaughtError(res, error, "Failed to pay invoices");
@@ -551,6 +570,11 @@ export const collectInvoiceHandler = async (req: Request, res: Response) => {
       timestamp: new Date(),
       data: { paymentMethod }
     });
+    await writeAuditLog({
+      req,
+      action: "billing.invoice.collect",
+      meta: { invoiceId: invoice.id, paymentMethod },
+    });
 
     sendResponse(res, true, 200, "Invoice collected and marked as paid", invoice);
   } catch (error) {
@@ -574,6 +598,11 @@ export const reconcileInvoiceCashHandler = async (req: Request, res: Response) =
       username,
       action: 'RECONCILED',
       timestamp: new Date(),
+    });
+    await writeAuditLog({
+      req,
+      action: "billing.invoice.reconcile",
+      meta: { invoiceId: invoice.id },
     });
 
     sendResponse(res, true, 200, "Invoice cash reconciled", invoice);
@@ -622,6 +651,12 @@ export const reconcileBulkCashHandler = async (req: Request, res: Response) => {
         data: { bulk: true },
       });
     }
+
+    await writeAuditLog({
+      req,
+      action: "billing.invoice.reconcileBulk",
+      meta: { dateFrom, dateTo, collector: effectiveCollector, count: result.reconciledIds?.length ?? 0 },
+    });
 
     sendResponse(res, true, 200, "Bulk cash reconciliation completed", result);
   } catch (error) {
@@ -1200,7 +1235,7 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
       return sendResponse(res, false, 400, "Invalid invoice ID");
     }
 
-    const paymentMethod = (req.body?.paymentMethod || 'cash') as 'cash' | 'pos' | 'transfer' | 'other' | 'gateway';
+    const paymentMethod = (req.body?.paymentMethod || 'cash') as 'cash' | 'pos' | 'transfer' | 'other' | 'gateway' | 'wallet';
     const actor = req.user?.username || 'system';
     const paymentReference = req.body?.paymentReference
       ? String(req.body.paymentReference).trim()
@@ -1211,23 +1246,59 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
       ? String(req.body.paymentProvider).trim()
       : paymentMethod === "gateway" || paymentReference
         ? "whish"
-        : undefined;
+        : paymentMethod === "wallet"
+          ? "wallet"
+          : undefined;
+    const paidAmountRaw = req.body?.paidAmount;
+    const paidAmount =
+      paidAmountRaw == null || paidAmountRaw === ""
+        ? null
+        : Number(paidAmountRaw);
+    const debitRemainder = Boolean(req.body?.debitRemainder);
 
     const invoice = await payExternalInvoice(invoiceId, actor, paymentMethod, {
       paymentReference,
       paymentProvider,
+      paidAmount: Number.isFinite(paidAmount as number) ? (paidAmount as number) : null,
+      debitRemainder,
     });
 
     // Emit modification event
+    const remaining = Number((invoice as any).remainingDue ?? 0);
+    const isPartial = remaining >= 0.01;
+
     invoiceEvents.emitModification({
       invoiceId: invoice.id || -1,
       username: req.user?.username || 'system',
-      action: 'PAID',
+      action: isPartial ? 'UPDATED' : 'PAID',
       timestamp: new Date(),
       data: invoice
     });
+    await writeAuditLog({
+      req,
+      action: "billing.externalInvoice.pay",
+      targetUsernames: invoice.username ? [invoice.username] : [],
+      meta: {
+        invoiceId: invoice.id,
+        paymentMethod,
+        paymentReference,
+        paymentProvider,
+        paidAmount: (invoice as any).amountPaid,
+        remainingDue: remaining,
+        debitRemainder,
+        remainderInvoiceId: (invoice as any).remainderInvoice?.id ?? null,
+      },
+    });
 
-    sendResponse(res, true, 200, "Invoice paid successfully", invoice);
+    sendResponse(
+      res,
+      true,
+      200,
+      isPartial ? "Partial payment recorded" : "Invoice paid successfully",
+      invoice
+    );
+
+    if (isPartial) return;
 
     // Fire-and-forget WhatsApp notification
     ;(async () => {
@@ -1280,6 +1351,12 @@ export const unpayExternalInvoiceHandler = async (req: Request, res: Response) =
       action: 'UNPAID',
       timestamp: new Date(),
       data: invoice,
+    });
+    await writeAuditLog({
+      req,
+      action: "billing.externalInvoice.unpay",
+      targetUsernames: invoice.username ? [invoice.username] : [],
+      meta: { invoiceId: invoice.id },
     });
 
     sendResponse(res, true, 200, "Invoice marked as unpaid", invoice);
@@ -1509,6 +1586,18 @@ export const runExternalDunningHandler = async (req: Request, res: Response) => 
       stages,
       selectedActions,
       throttleProfileId: throttleProfileId > 0 ? throttleProfileId : undefined,
+    });
+
+    await writeAuditLog({
+      req,
+      action: dryRun ? "billing.dunning.previewRun" : "billing.dunning.run",
+      meta: {
+        dryRun,
+        attempted: result.attempted,
+        sent: result.sent,
+        failed: result.failed,
+        actionSummary: result.actionSummary,
+      },
     });
 
     return sendResponse(res, true, 200, "Dunning run completed", result);

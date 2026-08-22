@@ -5,6 +5,10 @@ import {
   isWhatsAppGroupAutoPayEnabled,
   payExternalInvoiceFromWhatsAppGroupMessage,
 } from "../services/whatsappPaymentGroupService";
+import {
+  logInboundWhatsAppMessage,
+  updateInboundWhatsAppMessageResult,
+} from "../services/whatsappInboundMessageService";
 
 function verifyMetaSignature(req: Request, rawBody: Buffer): boolean {
   const secret = String(process.env.WHATSAPP_APP_SECRET || "").trim();
@@ -85,11 +89,17 @@ export const whatsappWebhookCloudHandler: RequestHandler = async (req, res) => {
 
     const messages = parseMetaCloudPayload(body);
     for (const msg of messages) {
+      const record = await logInboundWhatsAppMessage({
+        fromNumber: msg.from || "unknown",
+        rawText: msg.text,
+        messageSid: msg.messageId,
+      });
       const result = await payExternalInvoiceFromWhatsAppGroupMessage(msg.text, {
         groupId: msg.groupId,
         from: msg.from,
         messageId: msg.messageId,
       });
+      await updateInboundWhatsAppMessageResult(record?.id, result);
       console.log("[whatsapp-webhook] cloud message processed", { result, preview: msg.text.slice(0, 80) });
     }
   } catch (err) {
@@ -101,11 +111,15 @@ export const whatsappWebhookCloudHandler: RequestHandler = async (req, res) => {
 export const whatsappWebhookTwilioHandler: RequestHandler = async (req, res) => {
   try {
     const authToken = String(process.env.TWILIO_AUTH_TOKEN || "").trim();
-    if (authToken) {
+    const shouldValidateSignature = String(process.env.TWILIO_VALIDATE_SIGNATURE || "").toLowerCase() === "true";
+    if (authToken && shouldValidateSignature) {
       const signature = String(req.header("x-twilio-signature") || "");
-      const url = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
+      const proto = String(req.header("x-forwarded-proto") || req.protocol);
+      const host = String(req.header("x-forwarded-host") || req.get("host"));
+      const url = `${proto}://${host}${req.originalUrl}`;
       const valid = twilio.validateRequest(authToken, signature, url, req.body);
       if (!valid) {
+        console.warn("[whatsapp-webhook] Twilio signature validation failed for URL:", url);
         res.sendStatus(403);
         return;
       }
@@ -113,16 +127,26 @@ export const whatsappWebhookTwilioHandler: RequestHandler = async (req, res) => 
 
     const body = String(req.body?.Body || "").trim();
     const from = String(req.body?.From || req.body?.from || "");
+    const messageSid = String(req.body?.MessageSid || "");
 
     res.type("text/xml").send("<Response></Response>");
 
     if (!body) return;
 
+    const record = await logInboundWhatsAppMessage({
+      fromNumber: from,
+      rawText: body,
+      messageSid,
+    });
+
     const result = await payExternalInvoiceFromWhatsAppGroupMessage(body, {
       from,
       groupId: from.includes("@g.us") ? from : undefined,
-      messageId: String(req.body?.MessageSid || ""),
+      messageId: messageSid,
     });
+
+    await updateInboundWhatsAppMessageResult(record?.id, result);
+
     console.log(
       "[whatsapp-webhook] twilio message processed",
       JSON.stringify({

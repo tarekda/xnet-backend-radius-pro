@@ -41,7 +41,13 @@ import { SubscriberRefreshTokens } from './entities/SubscriberRefreshTokens';
 import { PaymentIntent } from './entities/PaymentIntent';
 import { WhishPaymentClaim } from './entities/WhishPaymentClaim';
 import { WhatsappPaymentAmbiguity } from './entities/WhatsappPaymentAmbiguity';
+import { WhatsappInboundMessage } from './entities/WhatsappInboundMessage';
 import { SubscriberWalletEntry } from './entities/SubscriberWalletEntry';
+import { AlertRule } from './entities/AlertRule';
+import { AlertIncident } from './entities/AlertIncident';
+import { AlertSettings } from './entities/AlertSettings';
+import { CompanyWalletEntry } from './entities/CompanyWalletEntry';
+import { InvoicePayment } from './entities/InvoicePayment';
 
 // Create entities array with explicit references
 const entities = [
@@ -67,6 +73,7 @@ const entities = [
     PaymentIntent,
     WhishPaymentClaim,
     WhatsappPaymentAmbiguity,
+    WhatsappInboundMessage,
     SubscriberWalletEntry,
     Role,
     RolePermission,
@@ -79,7 +86,12 @@ const entities = [
     UserDetails,
     UserMac,
     UserPermissionOverride,
-    Expense
+    Expense,
+    AlertRule,
+    AlertIncident,
+    AlertSettings,
+    CompanyWalletEntry,
+    InvoicePayment,
 ];
 
 export const AppDataSource = new DataSource({
@@ -151,6 +163,57 @@ async function ensureExternalInvoiceDebitLabelColumn(): Promise<void> {
     console.log("✅ Added external_invoices.debitLabel");
 }
 
+async function ensureExternalInvoiceAmountPaidColumn(): Promise<void> {
+    const rows = (await AppDataSource.query(
+        `SELECT COUNT(*) AS cnt
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'external_invoices'
+           AND COLUMN_NAME = 'amount_paid'`
+    )) as Array<{ cnt: string | number }>;
+    if (Number(rows?.[0]?.cnt ?? 0) > 0) return;
+    await AppDataSource.query(
+        `ALTER TABLE external_invoices
+           ADD COLUMN amount_paid DECIMAL(12,2) NOT NULL DEFAULT 0
+           AFTER total_amount`
+    );
+    console.log("✅ Added external_invoices.amount_paid");
+}
+
+async function ensureCompanyWalletAndInvoicePaymentTables(): Promise<void> {
+    await AppDataSource.query(`
+      CREATE TABLE IF NOT EXISTS company_wallet_ledger (
+        id BIGINT NOT NULL AUTO_INCREMENT,
+        amount DECIMAL(12,2) NOT NULL,
+        currency VARCHAR(8) NOT NULL DEFAULT 'USD',
+        entry_type ENUM('credit','debit') NOT NULL,
+        reference_type VARCHAR(64) NULL,
+        reference_id VARCHAR(64) NULL,
+        note VARCHAR(255) NULL,
+        created_by VARCHAR(64) NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_company_wallet_ref (reference_type, reference_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+    await AppDataSource.query(`
+      CREATE TABLE IF NOT EXISTS invoice_payments (
+        id INT NOT NULL AUTO_INCREMENT,
+        external_invoice_id INT NOT NULL,
+        amount DECIMAL(12,2) NOT NULL,
+        method VARCHAR(20) NOT NULL,
+        payment_reference VARCHAR(128) NULL,
+        payment_provider VARCHAR(32) NULL,
+        created_by VARCHAR(64) NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        voided_at TIMESTAMP NULL,
+        voided_by VARCHAR(64) NULL,
+        PRIMARY KEY (id),
+        KEY idx_invoice_payments_invoice (external_invoice_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+}
+
 export const initializeDB = async () => {
     try {
         // Debug: Log entities being loaded
@@ -178,6 +241,18 @@ export const initializeDB = async () => {
             await ensureExternalInvoiceDebitLabelColumn();
         } catch (patchError: any) {
             console.warn("⚠️ debitLabel schema patch skipped:", patchError?.message || patchError);
+        }
+
+        try {
+            await ensureExternalInvoiceAmountPaidColumn();
+        } catch (patchError: any) {
+            console.warn("⚠️ amount_paid schema patch skipped:", patchError?.message || patchError);
+        }
+
+        try {
+            await ensureCompanyWalletAndInvoicePaymentTables();
+        } catch (patchError: any) {
+            console.warn("⚠️ company wallet / invoice_payments schema patch skipped:", patchError?.message || patchError);
         }
     } catch (error: any) {
         console.error("❌ Error connecting to database:", error);

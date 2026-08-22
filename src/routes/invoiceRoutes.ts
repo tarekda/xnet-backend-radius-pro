@@ -6,6 +6,10 @@ import {
   listWhatsappPaymentAmbiguitiesHandler,
   resolveWhatsappPaymentAmbiguityHandler,
 } from "../controllers/whatsappPaymentAmbiguityController";
+import {
+  getInboundWhatsAppMessagesHandler,
+  retryInboundWhatsAppMessageHandler,
+} from "../controllers/whatsappInboundController";
 import multer from "multer";
 import { authenticateToken, authorizeAnyPermissions, authorizePermissions, authorizeRoles } from '../middleware/authMiddleware';
 const upload = multer({
@@ -164,6 +168,21 @@ router.post(
   dismissWhatsappPaymentAmbiguityHandler
 );
 router.get(
+  "/external/whatsapp-inbound-messages",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.pay"
+  ),
+  getInboundWhatsAppMessagesHandler
+);
+router.post(
+  "/external/whatsapp-inbound-messages/:id/retry",
+  authenticateToken,
+  authorizePermissions("billing.externalInvoices.pay"),
+  retryInboundWhatsAppMessageHandler
+);
+router.get(
   "/external/:invoiceId/history",
   authenticateToken,
   authorizeAnyPermissions(
@@ -227,11 +246,7 @@ router.get(
 router.post(
   "/external/dunning/run",
   authenticateToken,
-  authorizeAnyPermissions(
-    "billing.externalInvoices.view",
-    "billing.externalInvoices.viewTotals",
-    "billing.externalInvoices.pay"
-  ),
+  authorizePermissions("billing.externalInvoices.dunning"),
   runExternalDunningHandler
 );
 router.put(

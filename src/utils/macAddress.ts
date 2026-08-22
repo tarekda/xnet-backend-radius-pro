@@ -8,6 +8,7 @@ export function extractMacAddress(value: unknown): string | null {
 
   const candidates = [
     raw.match(/(?:^|[^0-9a-f])((?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2})(?:$|[^0-9a-f])/i)?.[1],
+    raw.match(/(?:^|[^0-9a-f])((?:[0-9a-f]{2}\s){5}[0-9a-f]{2})(?:$|[^0-9a-f])/i)?.[1],
     raw.match(/(?:^|[^0-9a-f])((?:[0-9a-f]{4}\.){2}[0-9a-f]{4})(?:$|[^0-9a-f])/i)?.[1],
     raw.match(/(?:^|[^0-9a-f])([0-9a-f]{12})(?:$|[^0-9a-f])/i)?.[1],
   ];
@@ -16,5 +17,6 @@ export function extractMacAddress(value: unknown): string | null {
   if (!candidate) return null;
 
   const hex = candidate.replace(/[^0-9a-f]/gi, "").toUpperCase();
+  if (hex.length !== 12) return null;
   return hex.match(/.{2}/g)?.join(":") ?? null;
 }

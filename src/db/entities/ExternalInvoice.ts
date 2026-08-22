@@ -30,6 +30,10 @@ export class ExternalInvoice {
   @Column("float", { name: "total_amount", nullable: true })
   totalAmount: number | null;
 
+  /** Cumulative collected amount. Remaining due = (totalAmount ?? amount) - amountPaid. */
+  @Column("decimal", { name: "amount_paid", precision: 12, scale: 2, default: 0 })
+  amountPaid: number;
+
   @Column("varchar", { name: "document_type", length: 20, default: () => "'invoice'" })
   documentType: "invoice" | "credit_note";
 

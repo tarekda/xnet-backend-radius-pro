@@ -8,7 +8,9 @@ import { normalizeBillingMonthKey } from "./invoiceService";
 export { payExternalInvoicesFromWhatsAppInbound } from "./whatsappInboundPayService";
 
 export function isWhatsAppGroupAutoPayEnabled(): boolean {
-  return String(process.env.WHATSAPP_GROUP_AUTO_PAY_ENABLED || "").toLowerCase() === "true";
+  const val = String(process.env.WHATSAPP_GROUP_AUTO_PAY_ENABLED || "").trim().toLowerCase();
+  if (val === "false" || val === "0" || val === "off") return false;
+  return true;
 }
 
 export function normalizePaymentLookupKey(raw: string): string {
@@ -82,11 +84,11 @@ export function normalizeAmountDigits(raw: string): string {
   return t;
 }
 
-/** Parse trailing numeric token as paid amount (e.g. 25, 25.5, ٢٥, ٢٥٫٥). */
+/** Parse trailing numeric token as paid amount (e.g. 25, 25.5, ٢٥, ٢٥٫٥, 0, 0$, $0). */
 export function parseTrailingPaidAmount(token: string): number | null {
   let t = String(token || "").trim();
   if (!t) return null;
-  t = t.replace(/^[$€£]/, "").replace(/[$€£]$/, "");
+  t = t.replace(/[$€£\s]/g, "");
   t = normalizeAmountDigits(t);
   if (t.includes(",") && !t.includes(".")) {
     t = t.replace(",", ".");
@@ -101,7 +103,7 @@ export function parseTrailingPaidAmount(token: string): number | null {
   }
   if (!/^\d+(\.\d{1,2})?$/.test(t)) return null;
   const n = parseFloat(t);
-  if (!Number.isFinite(n) || n <= 0) return null;
+  if (!Number.isFinite(n) || n < 0) return null;
   return Math.round(n * 100) / 100;
 }
 
@@ -110,6 +112,7 @@ export type WhatsAppPaymentLine = { name: string; amount: number | null };
 /**
  * One line: subscriber name, optional amount as the last token.
  * Example: `طارق دعبول 25` → name `طارق دعبول`, amount 25
+ * Example: `سامر دندش 0$` → name `سامر دندش`, amount null (pay invoice in full)
  */
 export function parsePaymentLineFromPart(raw: string): WhatsAppPaymentLine | null {
   let text = stripPaymentMessagePrefix(raw);
@@ -121,9 +124,11 @@ export function parsePaymentLineFromPart(raw: string): WhatsAppPaymentLine | nul
   if (parts.length >= 2) {
     const last = parts[parts.length - 1];
     const amount = parseTrailingPaidAmount(last);
-    if (amount != null) {
+    if (amount !== null) {
       const name = parts.slice(0, -1).join(" ").trim();
-      if (name) return { name, amount };
+      if (name) {
+        return { name, amount: amount > 0 ? amount : null };
+      }
     }
   }
 

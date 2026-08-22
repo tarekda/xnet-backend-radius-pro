@@ -10,6 +10,7 @@ import { Radprofile } from "../db/entities/Radprofile";
 import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import { Radacct } from "../db/entities/Radacct";
 import { SubscriberRefreshTokens } from "../db/entities/SubscriberRefreshTokens";
+import { SubscriberWalletEntry } from "../db/entities/SubscriberWalletEntry";
 import { getJwtSecret, getRefreshTokenSecret } from "../config/requireSecrets";
 import { createPaymentIntent, getPaymentProviderStatus } from "../services/paymentGatewayService";
 import {
@@ -214,10 +215,13 @@ export const subscriberInvoices = async (req: Request, res: Response) => {
   const enriched = await Promise.all(
     invoices.map(async (inv) => {
       const due = Number(inv.totalAmount ?? inv.amount ?? 0);
+      const paidFromColumn = Number(inv.amountPaid ?? 0);
       const paid =
         String(inv.status).toLowerCase() === "paid"
           ? due
-          : await getWalletPaidTowardInvoice(inv.id!);
+          : paidFromColumn > 0
+            ? paidFromColumn
+            : await getWalletPaidTowardInvoice(inv.id!);
       const remainingDue = Math.max(0, Math.round((due - paid) * 100) / 100);
       return {
         ...inv,
@@ -358,5 +362,133 @@ export const subscriberPayFromWallet = async (req: Request, res: Response) => {
   } catch (e: any) {
     const status = e?.status && Number.isFinite(e.status) ? e.status : 400;
     res.status(status).json({ success: false, message: e?.message || "Wallet payment failed" });
+  }
+};
+
+export const subscriberRedeemVoucher = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const username = req.subscriber!.username;
+    const pinCode = String(req.body?.pinCode || req.body?.pin || "").trim();
+
+    if (!pinCode) {
+      res.status(400).json({ success: false, message: "Voucher PIN code is required" });
+      return;
+    }
+
+    const { voucherService } = require("../services/voucherService");
+    const result = await voucherService.redeemVoucher(pinCode, username);
+    if (!result.success) {
+      res.status(400).json(result);
+      return;
+    }
+    res.status(200).json(result);
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: error?.message || "Voucher redemption failed" });
+  }
+};
+
+export const subscriberVoucherPlans = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const profiles = await AppDataSource.getRepository(Radprofile).find({
+      order: { price: "ASC", id: "ASC" } as any,
+    });
+    const plans = profiles
+      .filter((p) => Number(p.id) > 0 && String(p.profileName).toLowerCase() !== "fallback")
+      .map((p) => ({
+        id: p.id,
+        profileName: p.profileName,
+        price: Number(p.price || 15),
+        durationDays: 30,
+        monthlyQuotaGB: p.monthlyQuota ? Math.round(Number(p.monthlyQuota) / (1024 * 1024 * 1024)) : null,
+        speedDownMbps: p.speedDown ? Math.round(p.speedDown / 1024) : null,
+        speedUpMbps: p.speedUp ? Math.round(p.speedUp / 1024) : null,
+      }));
+    res.status(200).json({ success: true, data: plans });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: error?.message || "Failed to fetch voucher plans" });
+  }
+};
+
+export const subscriberBuyVoucher = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const username = req.subscriber!.username;
+    const profileId = parseInt(String(req.body?.profileId || req.body?.id), 10);
+    const durationDays = Math.max(1, parseInt(String(req.body?.durationDays || "30"), 10) || 30);
+
+    if (!profileId || !Number.isFinite(profileId)) {
+      res.status(400).json({ success: false, message: "Profile ID is required" });
+      return;
+    }
+
+    const profileRepo = AppDataSource.getRepository(Radprofile);
+    const profile = await profileRepo.findOne({ where: { id: Equal(profileId) } });
+    if (!profile) {
+      res.status(404).json({ success: false, message: "Voucher plan profile not found" });
+      return;
+    }
+
+    const price = Number(profile.price || 15);
+    const balance = await getWalletBalance(username);
+
+    if (balance < price) {
+      res.status(400).json({
+        success: false,
+        message: `Insufficient wallet balance ($${balance.toFixed(2)} available, $${price.toFixed(2)} required). Please top up your wallet first.`,
+      });
+      return;
+    }
+
+    let newExpiresAtDate = new Date();
+    await AppDataSource.transaction(async (manager) => {
+      // 1. Debit wallet balance
+      await manager.getRepository(SubscriberWalletEntry).save({
+        username,
+        entryType: "debit",
+        amount: String(price),
+        currency: "USD",
+        referenceType: "voucher_purchase",
+        referenceId: `profile:${profile.id}:${Date.now()}`,
+        note: `Purchased ${profile.profileName} plan (${durationDays} days)`,
+        createdBy: username,
+      });
+
+      // 2. Extend/Renew subscriber account
+      const userProfileRepo = manager.getRepository(Raduserprofile);
+      const userProfile = await userProfileRepo.findOne({ where: { username: Equal(username) } });
+
+      const now = new Date();
+      const currentExpiry = userProfile?.expiresAt ? new Date(userProfile.expiresAt) : now;
+      const baseDate = currentExpiry > now ? currentExpiry : now;
+      newExpiresAtDate = new Date(baseDate.getTime() + durationDays * 24 * 60 * 60 * 1000);
+
+      if (userProfile) {
+        userProfile.profileId = profile.id;
+        userProfile.accountStatus = "active";
+        userProfile.expiresAt = newExpiresAtDate;
+        userProfile.isFallback = false;
+        await userProfileRepo.save(userProfile);
+      } else {
+        const newEntity = userProfileRepo.create({
+          username,
+          profileId: profile.id,
+          accountStatus: "active",
+          expiresAt: newExpiresAtDate,
+          isFallback: false,
+        });
+        await userProfileRepo.save(newEntity);
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `Successfully purchased ${profile.profileName} plan for $${price.toFixed(2)}. Account renewed!`,
+      data: {
+        profileName: profile.profileName,
+        price,
+        newExpiresAt: newExpiresAtDate.toISOString(),
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: error?.message || "Failed to purchase voucher plan" });
   }
 };

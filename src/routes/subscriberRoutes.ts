@@ -17,6 +17,9 @@ import {
   subscriberWallet,
   subscriberWalletLedger,
   subscriberPayFromWallet,
+  subscriberRedeemVoucher,
+  subscriberVoucherPlans,
+  subscriberBuyVoucher,
 } from "../controllers/subscriberController";
 
 const authRouter = Router();
@@ -38,6 +41,9 @@ apiRouter.get("/invoices/:id/payment-claims", subscriberInvoiceClaims);
 apiRouter.post("/invoices/:id/payment-intent", subscriberPaymentIntent);
 apiRouter.post("/invoices/:id/report-whish-payment", subscriberReportWhishPayment);
 apiRouter.post("/invoices/:id/pay-from-wallet", subscriberPayFromWallet);
+apiRouter.post("/redeem-voucher", subscriberRedeemVoucher);
+apiRouter.get("/voucher-plans", subscriberVoucherPlans);
+apiRouter.post("/buy-voucher", subscriberBuyVoucher);
 
 export const subscriberAuthRoutes = authRouter;
 export const subscriberApiRoutes = apiRouter;

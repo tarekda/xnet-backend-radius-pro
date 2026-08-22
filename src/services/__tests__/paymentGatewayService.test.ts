@@ -40,6 +40,22 @@ describe("paymentGatewayService webhook helpers", () => {
     ).toEqual({ gatewayIntentId: "abc", status: "paid" });
   });
 
+  it("ignores PAYMENT_WEBHOOK_RELAXED in production", () => {
+    const prevEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    process.env.PAYMENT_WEBHOOK_RELAXED = "1";
+    process.env.WHISH_SECRET = "s3cret";
+    expect(
+      verifyProviderWebhookAuth({
+        provider: "whish",
+        rawBody: "{}",
+        secretParam: "wrong",
+      })
+    ).toBe(false);
+    if (prevEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prevEnv;
+  });
+
   it("verifyProviderWebhookAuth accepts WHISH_SECRET for whish", () => {
     process.env.PAYMENT_WEBHOOK_RELAXED = "0";
     process.env.WHISH_SECRET = "s3cret";

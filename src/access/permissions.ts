@@ -18,6 +18,7 @@ export const PERMISSIONS = [
   "ui.sidebar.admin.access.show",
   "ui.sidebar.admin.backups.show",
   "ui.sidebar.admin.resellers.show",
+  "ui.sidebar.admin.companyWallet.show",
 
   // Admin section
   "admin.analytics.view",
@@ -45,7 +46,10 @@ export const PERMISSIONS = [
   "billing.externalInvoices.viewTotals",
   "billing.externalInvoices.pay",
   "billing.externalInvoices.unpay",
+  "billing.externalInvoices.dunning",
   "billing.collections.view",
+  "billing.companyWallet.view",
+  "billing.companyWallet.manage",
 
   // Cable Vision
   "cablevision.accounts.view",

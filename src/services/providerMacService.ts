@@ -28,11 +28,18 @@ export type ProviderMacList = {
 export type ProviderMacSyncResult = {
   provider: string;
   billingMonth: string;
+  /** Active provider users that returned a parseable MAC. */
   providerMacs: number;
+  /** Invoice usernames that matched a provider MAC. */
   matchedSubscribers: number;
   updatedInvoiceRows: number;
+  /** Invoice usernames with no matching provider MAC. */
   missingSubscribers: number;
+  /** Unique MAC addresses from the live provider pull (not limited to invoice rows). */
+  macAddresses: string[];
 };
+
+const LIVE_MAC_PROVIDERS = new Set(["myisp", "myisp2", "idm", "terra"]);
 
 function normalizeBillingMonth(value: string): string {
   const match = /^(\d{4})-(\d{2})(?:-\d{2})?$/.exec(String(value || "").trim());
@@ -40,6 +47,36 @@ function normalizeBillingMonth(value: string): string {
   const month = Number(match[2]);
   if (month < 1 || month > 12) throw new Error("Billing month must use YYYY-MM format");
   return `${match[1]}-${match[2]}-01`;
+}
+
+function listFromMacMap(
+  provider: string,
+  billingMonthYm: string,
+  providerMacs: Map<string, string>
+): ProviderMacList {
+  const normalizedMacs = [...providerMacs.values()];
+  const macAddresses = Array.from(new Set(normalizedMacs)).sort();
+  return {
+    provider,
+    billingMonth: billingMonthYm,
+    macAddresses,
+    stats: {
+      totalSubscribers: providerMacs.size,
+      withMac: providerMacs.size,
+      missingMac: 0,
+      invalidMac: 0,
+      uniqueMacs: macAddresses.length,
+      duplicateAssignments: normalizedMacs.length - macAddresses.length,
+    },
+  };
+}
+
+async function fetchLiveProviderMacMap(provider: string): Promise<Map<string, string>> {
+  if (provider === "myisp" || provider === "myisp2") {
+    const account: MyISPAccount = provider === "myisp2" ? 2 : 1;
+    return fetchMyISPProviderMacAddresses(account);
+  }
+  return fetchHsiProviderMacAddresses(provider as HsiProvider);
 }
 
 export async function getInvoiceProvidersForMonth(billingMonth: string): Promise<string[]> {
@@ -58,15 +95,10 @@ export async function getInvoiceProvidersForMonth(billingMonth: string): Promise
   return rows.map((row) => String(row.provider || "").trim()).filter(Boolean);
 }
 
-export async function getProviderMacList(
-  providerInput: string,
-  billingMonth: string
+async function getInvoiceProviderMacList(
+  provider: string,
+  month: string
 ): Promise<ProviderMacList> {
-  const provider = String(providerInput || "").trim().toLowerCase();
-  if (!provider) throw new Error("Provider is required");
-  if (provider.length > 10) throw new Error("Provider is invalid");
-  const month = normalizeBillingMonth(billingMonth);
-
   const rows = await AppDataSource.getRepository(ExternalInvoice)
     .createQueryBuilder("invoice")
     .leftJoin(
@@ -122,22 +154,39 @@ export async function getProviderMacList(
   };
 }
 
+export async function getProviderMacList(
+  providerInput: string,
+  billingMonth: string
+): Promise<ProviderMacList> {
+  const provider = String(providerInput || "").trim().toLowerCase();
+  if (!provider) throw new Error("Provider is required");
+  if (provider.length > 10) throw new Error("Provider is invalid");
+  const month = normalizeBillingMonth(billingMonth);
+
+  // Live-capable providers: MAC download should reflect active provider users with a MAC,
+  // not only usernames that happen to exist in this month's invoice import.
+  if (LIVE_MAC_PROVIDERS.has(provider)) {
+    try {
+      const providerMacs = await fetchLiveProviderMacMap(provider);
+      return listFromMacMap(provider, month.slice(0, 7), providerMacs);
+    } catch {
+      // Fall back to invoice-stored MACs when the provider is unreachable.
+    }
+  }
+
+  return getInvoiceProviderMacList(provider, month);
+}
+
 export async function syncProviderMacAddresses(
   providerInput: string,
   billingMonth: string
 ): Promise<ProviderMacSyncResult> {
   const provider = String(providerInput || "").trim().toLowerCase();
-  if (!["myisp", "myisp2", "idm", "terra"].includes(provider)) {
+  if (!LIVE_MAC_PROVIDERS.has(provider)) {
     throw new Error("Live MAC sync is unavailable for this provider");
   }
   const month = normalizeBillingMonth(billingMonth);
-  let providerMacs: Map<string, string>;
-  if (provider === "myisp" || provider === "myisp2") {
-    const account: MyISPAccount = provider === "myisp2" ? 2 : 1;
-    providerMacs = await fetchMyISPProviderMacAddresses(account);
-  } else {
-    providerMacs = await fetchHsiProviderMacAddresses(provider as HsiProvider);
-  }
+  const providerMacs = await fetchLiveProviderMacMap(provider);
 
   const repo = AppDataSource.getRepository(ExternalInvoice);
   const invoices = await repo
@@ -166,6 +215,7 @@ export async function syncProviderMacAddresses(
 
   if (changed.length) await repo.save(changed, { chunk: 250 });
 
+  const list = listFromMacMap(provider, month.slice(0, 7), providerMacs);
   return {
     provider,
     billingMonth: month.slice(0, 7),
@@ -173,5 +223,6 @@ export async function syncProviderMacAddresses(
     matchedSubscribers: matchedSubscribers.size,
     updatedInvoiceRows: changed.length,
     missingSubscribers: invoiceSubscribers.size - matchedSubscribers.size,
+    macAddresses: list.macAddresses,
   };
 }

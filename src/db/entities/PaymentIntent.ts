@@ -22,7 +22,7 @@ export class PaymentIntent {
   gatewayIntentId!: string;
 
   @Column("varchar", { name: "status", length: 20, default: () => "'pending'" })
-  status!: "pending" | "succeeded" | "failed" | "expired";
+  status!: "pending" | "processing" | "succeeded" | "failed" | "expired";
 
   @Column("float", { name: "amount", precision: 12 })
   amount!: number;

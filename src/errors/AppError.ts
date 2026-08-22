@@ -56,6 +56,12 @@ export function coerceToAppError(err: unknown): AppError {
   if (err instanceof AppError) return err;
   const message = err instanceof Error ? err.message : "Internal Server Error";
   const lower = message.toLowerCase();
+  const status = typeof (err as { status?: unknown })?.status === "number"
+    ? (err as { status: number }).status
+    : undefined;
+  if (status && status >= 400 && status < 500) {
+    return new AppError(message, status, status === 400 ? "BAD_REQUEST" : "CLIENT_ERROR", true);
+  }
   if (lower === "invoice not found" || lower.includes("not found")) {
     return new NotFoundError(message);
   }
@@ -66,7 +72,11 @@ export function coerceToAppError(err: unknown): AppError {
     lower.includes("not collected") ||
     lower.includes("only cash") ||
     lower.includes("required") ||
-    lower.includes("invalid")
+    lower.includes("invalid") ||
+    lower.includes("insufficient") ||
+    lower.includes("exceeds remaining") ||
+    lower.includes("must be greater") ||
+    lower.includes("must be positive")
   ) {
     return new BadRequestError(message);
   }

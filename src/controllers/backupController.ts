@@ -368,6 +368,13 @@ async function startDbBackupJob(): Promise<BackupMeta> {
 
     try {
       const result = await runMysqldumpToGzipFile(outPath);
+      let offsitePath: string | undefined;
+      const offsiteDir = String(process.env.BACKUP_OFFSITE_DIR || "").trim();
+      if (offsiteDir) {
+        await fsp.mkdir(offsiteDir, { recursive: true });
+        offsitePath = path.join(offsiteDir, filename);
+        await fsp.copyFile(outPath, offsitePath);
+      }
       await updateIndex(id, {
         status: "success",
         finishedAt: new Date().toISOString(),
@@ -376,6 +383,7 @@ async function startDbBackupJob(): Promise<BackupMeta> {
           ...(meta.details ?? {}),
           mode: result.mode,
           lastHeartbeatAt: new Date().toISOString(),
+          ...(offsitePath ? { offsitePath } : {}),
         },
       });
     } catch (e: any) {

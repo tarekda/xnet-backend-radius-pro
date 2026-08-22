@@ -96,11 +96,18 @@ export async function completeLoginAfterPassword(user: SystemUsers, res: Respons
   }
 
   const session = await issueStaffTokens(user);
+  const enrollmentRequired = mfaRequiredForRole(user.role) && !user.mfaEnabled;
   if (envelope === "mobile") {
-    res.status(200).json(session);
+    res.status(200).json(
+      enrollmentRequired ? { ...session, mfaEnrollmentRequired: true } : session
+    );
     return;
   }
-  res.status(200).json({ success: true, message: "Login successful", data: session });
+  res.status(200).json({
+    success: true,
+    message: enrollmentRequired ? "MFA enrollment required" : "Login successful",
+    data: enrollmentRequired ? { ...session, mfaEnrollmentRequired: true } : session,
+  });
 }
 
 export const verifyMfaLogin = async (req: Request, res: Response) => {

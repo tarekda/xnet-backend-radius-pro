@@ -53,6 +53,10 @@ export async function payExternalInvoicesFromWhatsAppInbound(
       invoiceId: paid.id,
       fullName: paid.fullName,
       username: paid.username,
+      amount: paid.amountPaid ?? paid.totalAmount ?? paid.amount,
+      paidAmount: meta?.paidAmount ?? null,
+      matchedName,
+      from: meta?.from ?? null,
       source: "whatsapp_inbound",
     });
   }

@@ -9,7 +9,15 @@ import { cleanupOldBackups, runDbBackup, runMikrotikBackup } from "../controller
  * - BACKUP_RETENTION_DAYS: retention window (default 14)
  */
 export function startBackupScheduler(app: any) {
-  const dbCron = String(process.env.BACKUP_DB_CRON ?? "").trim();
+  const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+  const configuredDbCron = String(process.env.BACKUP_DB_CRON ?? "").trim();
+  const dbCron = configuredDbCron || (isProduction ? "0 2 * * *" : "");
+  if (isProduction && !configuredDbCron) {
+    console.warn("[backup] BACKUP_DB_CRON unset in production; defaulting to 0 2 * * * (02:00 local)");
+  }
+  if (isProduction && !String(process.env.BACKUP_OFFSITE_DIR || "").trim()) {
+    console.warn("[backup] BACKUP_OFFSITE_DIR is unset. Local backups stay on this disk until you set an off-site copy path.");
+  }
   const mkCron = String(process.env.BACKUP_MIKROTIK_CRON ?? "").trim();
 
   // Daily cleanup at 03:15 by default (can be overridden)

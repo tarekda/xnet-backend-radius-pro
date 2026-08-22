@@ -7,7 +7,7 @@ import { redisClient } from "../redisClient"
 import { UserMac } from '../db/entities/UserMac';
 import { Radusagestats } from '../db/entities/Radusagestats';
 import { Radcheck } from '../db/entities/Radcheck';
-import { Logs } from '../db/entities/Logs';
+import { writeAuditLog } from '../audit/writeAuditLog';
 import { promisify } from "util";
 import { exec } from 'child_process';
 import util from "util";
@@ -97,35 +97,6 @@ function normalizeUsernames(input: unknown): string[] {
         .filter((u) => u.length > 0)
         .map((u) => u.toLowerCase() === u ? u : u); // preserve exact value (no forced lowercasing)
     return Array.from(new Set(cleaned));
-}
-
-async function writeAuditLog(params: {
-    req: Request;
-    action: string;
-    targetUsernames: string[];
-    meta?: Record<string, any>;
-}) {
-    try {
-        const repo = AppDataSource.getRepository(Logs);
-        const entry = new Logs();
-        entry.level = "info";
-        entry.message = `audit.${params.action}`;
-        entry.meta = {
-            requestId: (params.req as any)?.requestId,
-            actor: {
-                id: (params.req.user as any)?.id ?? null,
-                username: (params.req.user as any)?.username ?? null,
-                role: (params.req.user as any)?.role ?? null,
-                resellerId: (params.req.user as any)?.resellerId ?? null,
-            },
-            targets: params.targetUsernames,
-            ...(params.meta ?? {}),
-        };
-        await repo.save(entry);
-    } catch (e) {
-        // Never fail the main request due to audit logging issues.
-        console.warn("Audit log write failed", e);
-    }
 }
 
 function getResellerFilter(req: Request): { isReseller: boolean; resellerId: number | null } {
@@ -1462,6 +1433,32 @@ export const UserController = {
                     "lastActive",
                     "user.username = lastActive.la_username"
                 )
+                .select([
+                    "user.id",
+                    "user.username",
+                    "user.profileId",
+                    "user.freenight",
+                    "user.isFallback",
+                    "user.isMonthlyExceeded",
+                    "user.quotaResetDay",
+                    "user.quotaCycleStartDate",
+                    "user.accountStatus",
+                    "user.expiresAt",
+                    "user.expiryFramedIp",
+                    "user.ownerResellerId",
+                    "profile.id",
+                    "profile.profileName",
+                    "profile.dailyQuota",
+                    "profile.monthlyQuota",
+                    "profile.speedDown",
+                    "profile.speedUp",
+                    "mac.macAddress",
+                    "radcheck.value",
+                    "userDetails.fullName",
+                    "userDetails.address",
+                    "userDetails.phoneNumber",
+                    "userDetails.email",
+                ])
                 .addSelect(
                     "CASE WHEN COALESCE(activeSess.is_online, 0) = 1 THEN true ELSE false END",
                     "isOnline"
@@ -1495,32 +1492,6 @@ export const UserController = {
             }
 
             const { entities, raw } = await qb
-                .select([
-                    "user.id",
-                    "user.username",
-                    "user.profileId",
-                    "user.freenight",
-                    "user.isFallback",
-                    "user.isMonthlyExceeded",
-                    "user.quotaResetDay",
-                    "user.quotaCycleStartDate",
-                    "user.accountStatus",
-                    "user.expiresAt",
-                    "user.expiryFramedIp",
-                    "user.ownerResellerId",
-                    "profile.id",
-                    "profile.profileName",
-                    "profile.dailyQuota",
-                    "profile.monthlyQuota",
-                    "profile.speedDown",
-                    "profile.speedUp",
-                    "mac.macAddress",
-                    "radcheck.value",
-                    "userDetails.fullName",
-                    "userDetails.address",
-                    "userDetails.phoneNumber",
-                    "userDetails.email",
-                ])
                 .orderBy("user.id", "ASC")
                 .setParameters({ staleCutoff, activeCutoff })
                 .getRawAndEntities();

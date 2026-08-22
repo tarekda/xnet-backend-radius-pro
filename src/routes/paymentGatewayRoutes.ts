@@ -17,6 +17,7 @@ import {
 } from "../services/whishPaymentClaimService";
 import {
   adminCreditWallet,
+  adminDebitWallet,
   getWalletBalance,
   listWalletLedger,
 } from "../services/subscriberWalletService";
@@ -109,6 +110,35 @@ router.post(
     } catch (e: any) {
       const status = e?.status && Number.isFinite(e.status) ? e.status : 400;
       res.status(status).json({ success: false, message: e?.message || "Failed to credit wallet" });
+    }
+  }
+);
+
+router.post(
+  "/subscriber-wallet/debit",
+  authenticateToken,
+  authorizeAnyPermissions("billing.externalInvoices.pay"),
+  async (req: Request, res: Response) => {
+    try {
+      const username = String(req.body?.username || "").trim();
+      const amount = Number(req.body?.amount);
+      const note = req.body?.note ? String(req.body.note) : undefined;
+      const actor = (req.user as any)?.username || "system";
+      if (!username) {
+        res.status(400).json({ success: false, message: "username is required" });
+        return;
+      }
+      const entry = await adminDebitWallet({
+        username,
+        amount,
+        note,
+        createdBy: actor,
+      });
+      const balance = await getWalletBalance(username);
+      res.status(201).json({ success: true, data: { entry, balance } });
+    } catch (e: any) {
+      const status = e?.status && Number.isFinite(e.status) ? e.status : 400;
+      res.status(status).json({ success: false, message: e?.message || "Failed to debit wallet" });
     }
   }
 );

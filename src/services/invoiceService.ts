@@ -1,14 +1,19 @@
 // src/services/invoice.service.ts
 import { AppDataSource } from '../db/config';
-import { In, IsNull, SelectQueryBuilder } from 'typeorm';
+import { EntityManager, In, IsNull, SelectQueryBuilder } from 'typeorm';
 import { Raduserprofile } from "../db/entities/Raduserprofile";
 import { Invoices } from "../db/entities/Invoices";
 import { startOfMonth } from "date-fns";
 import { UserDetails } from '../db/entities/UserDetails';
 import { ExternalInvoice } from '../db/entities/ExternalInvoice';
+import { InvoicePayment } from '../db/entities/InvoicePayment';
 import { ModificationLog } from '../db/entities/ModificationLog';
 import { invoiceEvents } from '../events/invoiceEvents';
 import { recordInvoicePayment } from '../metrics/metrics';
+import { applyInvoicePayment } from '../billing/applyInvoicePayment';
+import { invoiceDue, remainingDue, resolvePaymentApply, roundMoney, withPaymentProgress } from '../billing/paymentMath';
+import { creditWallet, debitWallet, getWalletPaidTowardInvoice } from './subscriberWalletService';
+import { reverseCompanyInvoicePayment } from './companyWalletService';
 
 /** Default VAT/tax rate for new invoices (e.g. 0.11 = 11%). 0 = tax inclusive amount only. */
 function defaultInvoiceTaxRate(): number {
@@ -444,7 +449,12 @@ export const payExternalInvoice = async (
     invoiceId: number,
     actorUsername: string,
     paymentMethod: 'cash' | 'pos' | 'transfer' | 'other' | 'gateway' | 'wallet' = 'cash',
-    extras?: { paymentReference?: string | null; paymentProvider?: string | null; paidAmount?: number | null }
+    extras?: {
+        paymentReference?: string | null;
+        paymentProvider?: string | null;
+        paidAmount?: number | null;
+        debitRemainder?: boolean;
+    }
 ) => {
     return AppDataSource.transaction(async (manager) => {
         const invoiceRepo = manager.getRepository(ExternalInvoice);
@@ -453,42 +463,80 @@ export const payExternalInvoice = async (
             lock: { mode: "pessimistic_write" },
         });
         if (!invoice) {
-            throw new Error("Invoice not found");
+            throw Object.assign(new Error("Invoice not found"), { status: 404 });
         }
-        // Idempotent: double-submit / retry must not re-fire side effects
         if (String(invoice.status).toLowerCase() === "paid") {
             recordInvoicePayment("external_pay", "idempotent");
-            return invoice;
+            return { ...withPaymentProgress(invoice), remainderInvoice: null as ExternalInvoice | null };
         }
 
-        const paidAmount = extras?.paidAmount;
-        if (paidAmount != null && Number.isFinite(paidAmount) && paidAmount > 0) {
-            invoice.amount = paidAmount;
-            if (invoice.totalAmount != null) {
-                invoice.totalAmount = paidAmount;
-            }
+        const due = invoiceDue(invoice);
+        const paidSoFar = roundMoney(Number(invoice.amountPaid ?? 0));
+        const left = remainingDue(due, paidSoFar);
+        if (left < 0.01) {
+            invoice.status = "paid";
+            invoice.paidAt = new Date();
+            invoice.amountPaid = due;
+            await invoiceRepo.save(invoice);
+            recordInvoicePayment("external_pay", "ok");
+            return { ...withPaymentProgress(invoice), remainderInvoice: null as ExternalInvoice | null };
+        }
+
+        if (paymentMethod === "wallet") {
+            const { apply } = resolvePaymentApply(left, extras?.paidAmount);
+            const referenceId = `${invoice.id}:p${Date.now()}`;
+            await debitWallet({
+                username: invoice.username,
+                amount: apply,
+                currency: "USD",
+                referenceType: "external_invoice",
+                referenceId,
+                note: `Staff pay invoice #${invoice.id} from wallet`,
+                createdBy: actorUsername,
+                manager,
+            });
+            extras = {
+                ...extras,
+                paymentReference: extras?.paymentReference || `WALLET-${referenceId}`,
+                paymentProvider: extras?.paymentProvider || "wallet",
+            };
+        }
+
+        await applyInvoicePayment(manager, {
+            invoice,
+            amount: extras?.paidAmount,
+            method: paymentMethod,
+            actor: actorUsername,
+            paymentReference: extras?.paymentReference,
+            paymentProvider: extras?.paymentProvider,
+            creditCompany: paymentMethod !== "wallet",
+        });
+
+        let remainderInvoice: ExternalInvoice | null = null;
+        const leftover = remainingDue(invoiceDue(invoice), roundMoney(Number(invoice.amountPaid ?? 0)));
+        if (extras?.debitRemainder && leftover >= 0.01) {
+            remainderInvoice = await createExternalInvoiceDebit({
+                sourceInvoiceId: invoice.id,
+                debitLabel: `remainder-${Date.now()}`.slice(0, 64),
+                amount: leftover,
+                actorUsername,
+                parentInvoiceId: invoice.id,
+                manager,
+            });
+            const collected = roundMoney(Number(invoice.amountPaid ?? 0));
+            invoice.amount = collected;
+            invoice.totalAmount = collected;
             if (invoice.subtotalAmount != null) {
-                invoice.subtotalAmount = paidAmount;
+                invoice.subtotalAmount = collected;
             }
+            invoice.status = "paid";
+            invoice.paidAt = invoice.paidAt || new Date();
+            invoice.lastAction = `SPLIT_REMAINDER child=${remainderInvoice.id} applied=${collected.toFixed(2)} remainder=${leftover.toFixed(2)}`;
+            await invoiceRepo.save(invoice);
         }
 
-        invoice.status = "paid";
-        invoice.paidAt = new Date();
-        (invoice as any).paymentMethod = paymentMethod;
-        (invoice as any).collectedBy = actorUsername;
-        (invoice as any).collectedAt = new Date();
-        if (extras?.paymentReference) {
-            invoice.paymentReference = String(extras.paymentReference).slice(0, 128);
-        }
-        if (extras?.paymentProvider) {
-            invoice.paymentProvider = String(extras.paymentProvider).slice(0, 32);
-        } else if (paymentMethod === "gateway") {
-            invoice.paymentProvider = invoice.paymentProvider || "whish";
-        }
-
-        await invoiceRepo.save(invoice);
         recordInvoicePayment("external_pay", "ok");
-        return invoice;
+        return { ...withPaymentProgress(invoice), remainderInvoice };
     });
 };
 
@@ -500,14 +548,72 @@ export const unpayExternalInvoice = async (invoiceId: number, actorUsername: str
             lock: { mode: "pessimistic_write" },
         });
         if (!invoice) {
-            throw new Error("Invoice not found");
+            throw Object.assign(new Error("Invoice not found"), { status: 404 });
         }
-        if (String(invoice.status).toLowerCase() !== "paid") {
-            return invoice;
+        const paidSoFar = roundMoney(Number(invoice.amountPaid ?? 0));
+        const isPaid = String(invoice.status).toLowerCase() === "paid";
+        if (!isPaid && paidSoFar < 0.01) {
+            return withPaymentProgress(invoice);
+        }
+
+        const paymentRepo = manager.getRepository(InvoicePayment);
+        const payments = await paymentRepo.find({
+            where: { externalInvoiceId: invoiceId, voidedAt: IsNull() } as any,
+        });
+        const now = new Date();
+        let walletRefund = 0;
+        for (const payment of payments) {
+            payment.voidedAt = now;
+            payment.voidedBy = actorUsername;
+            await paymentRepo.save(payment);
+            await reverseCompanyInvoicePayment(payment.id, { actor: actorUsername, manager });
+            if (String(payment.method).toLowerCase() === "wallet") {
+                walletRefund = roundMoney(walletRefund + Number(payment.amount));
+            }
+        }
+
+        if (walletRefund < 0.01 && payments.length === 0 && paidSoFar >= 0.01) {
+            const toward = await getWalletPaidTowardInvoice(invoice.id!, manager);
+            walletRefund = roundMoney(Math.min(paidSoFar, toward));
+        }
+        if (walletRefund >= 0.01) {
+            await creditWallet({
+                username: invoice.username,
+                amount: walletRefund,
+                currency: "USD",
+                referenceType: "unpay_refund",
+                referenceId: String(invoice.id),
+                note: `Unpay refund for invoice #${invoice.id}`,
+                createdBy: actorUsername,
+                manager,
+            });
+        }
+
+        const children = await invoiceRepo.find({
+            where: { parentInvoiceId: invoiceId, deletedAt: IsNull() } as any,
+        });
+        let restoreBump = 0;
+        for (const child of children) {
+            if (!String(child.debitLabel || "").startsWith("remainder")) continue;
+            if (String(child.status).toLowerCase() === "paid" || roundMoney(Number(child.amountPaid ?? 0)) >= 0.01) {
+                continue;
+            }
+            restoreBump = roundMoney(restoreBump + invoiceDue(child));
+            child.deletedBy = actorUsername;
+            await invoiceRepo.softRemove(child);
+        }
+        if (restoreBump >= 0.01) {
+            const restored = roundMoney(invoiceDue(invoice) + restoreBump);
+            invoice.amount = restored;
+            invoice.totalAmount = restored;
+            if (invoice.subtotalAmount != null) {
+                invoice.subtotalAmount = restored;
+            }
         }
 
         invoice.status = "unpaid";
         invoice.paidAt = null;
+        invoice.amountPaid = 0;
         (invoice as any).paymentMethod = null;
         (invoice as any).collectedBy = null;
         invoice.paymentReference = null;
@@ -517,12 +623,12 @@ export const unpayExternalInvoice = async (invoiceId: number, actorUsername: str
         (invoice as any).reconciledBy = null;
         (invoice as any).reconciledAt = null;
         (invoice as any).modifiedBy = actorUsername;
-        (invoice as any).modifiedAt = new Date();
+        (invoice as any).modifiedAt = now;
         (invoice as any).lastAction = "UNPAY";
 
         await invoiceRepo.save(invoice);
         recordInvoicePayment("unpay", "ok");
-        return invoice;
+        return withPaymentProgress(invoice);
     });
 };
 
@@ -1108,7 +1214,7 @@ export const getExternalInvoicePaymentLines = async (
         qb.andWhere('e.provider = :provider', { provider: String(provider).trim() });
     }
 
-    return qb.getMany();
+    return (await qb.getMany()).map((row) => withPaymentProgress(row));
 };
 
 export const createExternalInvoiceDebit = async (input: {
@@ -1121,8 +1227,10 @@ export const createExternalInvoiceDebit = async (input: {
     payDueDate?: string | null;
     status?: string;
     actorUsername: string;
+    parentInvoiceId?: number | null;
+    manager?: EntityManager;
 }) => {
-    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const repo = (input.manager ?? AppDataSource).getRepository(ExternalInvoice);
     const label = normalizeDebitLabel(input.debitLabel);
     if (!label) {
         throw new Error('debitLabel is required (e.g. carryover, second-payment)');
@@ -1194,7 +1302,9 @@ export const createExternalInvoiceDebit = async (input: {
         taxAmount: tax.taxAmount,
         totalAmount: tax.totalAmount,
         documentType: 'invoice',
+        parentInvoiceId: input.parentInvoiceId ?? null,
         status: input.status || 'pending',
+        amountPaid: 0,
         payDueDate,
         modifiedBy: input.actorUsername,
         modifiedAt: new Date(),
@@ -1271,7 +1381,8 @@ export const getAllExternalInvoices = async (
     applyPayDueFilter(qb, 'externalInvoice', payDueFilter);
 
     // Fetch paginated results
-    const [data, total] = await qb.getManyAndCount();
+    const [rows, total] = await qb.getManyAndCount();
+    const data = rows.map((row) => withPaymentProgress(row));
 
     // 🔢 Get Metrics (non-paginated query for totals)
     const baseQb = externalInvoiceRepo.createQueryBuilder("externalInvoice");
@@ -1524,7 +1635,7 @@ export const getExternalInvoicesMonthlyTrend = async (months = 6) => {
 /** Open external invoices that have a payment target date set (for tracker + reminders). */
 export const getExternalInvoicesPaymentDueTracker = async (): Promise<ExternalInvoice[]> => {
     const repo = AppDataSource.getRepository(ExternalInvoice);
-    return repo
+    const rows = await repo
         .createQueryBuilder('e')
         .where('e.deletedAt IS NULL')
         .andWhere('e.voidedAt IS NULL')
@@ -1533,6 +1644,7 @@ export const getExternalInvoicesPaymentDueTracker = async (): Promise<ExternalIn
         .orderBy('e.payDueDate', 'ASC')
         .addOrderBy('e.id', 'ASC')
         .getMany();
+    return rows.map((row) => withPaymentProgress(row));
 };
 
 export const getExternalInvoiceById = async (invoiceId: number): Promise<ExternalInvoice> => {
@@ -1542,7 +1654,7 @@ export const getExternalInvoiceById = async (invoiceId: number): Promise<Externa
     if (!invoice) {
         throw new Error('External invoice not found');
     }
-    return invoice;
+    return withPaymentProgress(invoice);
 };
 
 export const getExternalInvoiceHistory = async (invoiceId: number, limit = 100) => {

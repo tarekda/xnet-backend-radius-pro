@@ -11,6 +11,9 @@ import { Equal } from 'typeorm';
 import { getEffectivePermissionsForUser } from '../access/permissionService';
 
 import { getJwtSecret, getRefreshTokenSecret } from '../config/requireSecrets';
+import { validateStaffPassword } from '../auth/staffPasswordPolicy';
+import { clearStaffLoginFailures, getStaffLoginLock, recordStaffLoginFailure } from '../auth/staffLoginLockout';
+import { writeAuditLog } from '../audit/writeAuditLog';
 
 const jwtSecret = getJwtSecret();
 const refreshTokenSecret = getRefreshTokenSecret();
@@ -122,10 +125,19 @@ export const register = [
         }
         throw new Error('Invalid email');
     }), // Email is optional,
-    body('password').isString().notEmpty(),
+    body('password').isString().custom((value) => {
+        const check = validateStaffPassword(String(value || ""));
+        if (!check.ok) throw new Error(check.message);
+        return true;
+    }),
     body('role').optional().isString().isIn(['admin', 'manager', 'support', 'collector', 'reseller']),
     body('isActive').optional().isBoolean(),
     async (req: Request, res: Response) => {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return sendResponse(res, false, 400, 'Validation errors', errors.array());
+        }
+
         const { username, email, password, role, isActive } = req.body;
         const userRepository = AppDataSource.getRepository(SystemUsers);
 
@@ -201,8 +213,9 @@ export const updateUser = [
     body('password').optional().isString().custom((value) => {
         // Treat empty string as "not provided" (frontend uses blank for no change)
         if (value === "" || value === null || value === undefined) return true;
-        if (typeof value === "string" && value.length >= 8) return true;
-        throw new Error("password must be at least 8 characters");
+        const check = validateStaffPassword(String(value));
+        if (!check.ok) throw new Error(check.message);
+        return true;
     }),
     body('role').optional().isString().isIn(['admin', 'manager', 'support', 'collector', 'reseller']),
     body('isActive').optional().isBoolean(),
@@ -251,8 +264,9 @@ export const adminResetUserPassword = async (req: Request, res: Response) => {
     const { newPassword, mustChangePassword } = req.body ?? {};
 
     if (!Number.isFinite(userId)) return sendResponse(res, false, 400, "Invalid id");
-    if (typeof newPassword !== "string" || newPassword.length < 8) {
-        return sendResponse(res, false, 400, "newPassword must be at least 8 characters");
+    const passwordCheck = validateStaffPassword(typeof newPassword === "string" ? newPassword : "");
+    if (!passwordCheck.ok) {
+        return sendResponse(res, false, 400, passwordCheck.message);
     }
 
     const userRepository = AppDataSource.getRepository(SystemUsers);
@@ -325,17 +339,29 @@ export const login = async (req: Request, res: Response) => {
     try {
 
         // 2️⃣ normalise (optional but recommended)
-        const lookup = username.trim().toLowerCase();
+        const lookup = String(username || "").trim().toLowerCase();
+        if (!lookup || typeof password !== "string") {
+            return sendResponse(res, false, 400, "username and password are required");
+        }
 
-        // 3️⃣ fetch the user – any mismatch will now give null
+        const lock = await getStaffLoginLock(lookup);
+        if (lock.locked) {
+            return sendResponse(res, false, 423, lock.message || "Account locked");
+        }
+
         const user = await userRepository.findOne({
             where: { username: Equal(lookup) },
         });
 
         if (!user || !(await bcrypt.compare(password, user.password))) {
+            const next = await recordStaffLoginFailure(lookup);
+            if (next.locked) {
+                return sendResponse(res, false, 423, next.message || "Account locked");
+            }
             return sendResponse(res, false, 401, 'Invalid credentials');
         }
 
+        await clearStaffLoginFailures(lookup);
         const { completeLoginAfterPassword } = await import('./mfaController');
         await completeLoginAfterPassword(user, res, 'web');
     } catch (error) {
@@ -487,8 +513,9 @@ export const changePassword = async (req: Request, res: Response) => {
     if (typeof currentPassword !== 'string' || currentPassword.length === 0) {
         return sendResponse(res, false, 400, 'currentPassword is required');
     }
-    if (typeof newPassword !== 'string' || newPassword.length < 8) {
-        return sendResponse(res, false, 400, 'newPassword must be at least 8 characters');
+    const passwordCheck = validateStaffPassword(typeof newPassword === "string" ? newPassword : "");
+    if (!passwordCheck.ok) {
+        return sendResponse(res, false, 400, passwordCheck.message);
     }
 
     const userRepository = AppDataSource.getRepository(SystemUsers);
@@ -552,6 +579,12 @@ export const deleteUser = async (req: Request, res: Response) => {
             return sendResponse(res, false, 404, 'User not found');
         }
 
+        await writeAuditLog({
+            req,
+            action: "admin.authUsers.delete",
+            targetUsernames: [user.username],
+            meta: { deletedUserId: user.id, role: user.role },
+        });
         await userRepository.remove(user);
         sendResponse(res, true, 204, 'User deleted successfully');
     } catch (error) {

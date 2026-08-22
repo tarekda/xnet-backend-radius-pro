@@ -3,6 +3,7 @@ import { authenticateToken, authorizePermissions } from "../middleware/authMiddl
 import {
   resellerAdminCreate,
   resellerAdminCreateLogin,
+  resellerAdminDebit,
   resellerAdminFund,
   resellerAdminLedger,
   resellerAdminList,
@@ -18,6 +19,7 @@ router.get("/admin/resellers", authenticateToken, ...resellerAdminList);
 router.post("/admin/resellers", authenticateToken, ...resellerAdminCreate);
 router.post("/admin/resellers/:id/login", authenticateToken, ...resellerAdminCreateLogin);
 router.post("/admin/resellers/:id/fund", authenticateToken, ...resellerAdminFund);
+router.post("/admin/resellers/:id/debit", authenticateToken, ...resellerAdminDebit);
 router.get("/admin/resellers/:id/ledger", authenticateToken, ...resellerAdminLedger);
 
 // Reseller portal endpoints

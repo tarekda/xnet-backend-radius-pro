@@ -3,6 +3,7 @@ import { AppDataSource } from "../db/config";
 import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import { WhishPaymentClaim } from "../db/entities/WhishPaymentClaim";
 import { creditWallet, getWalletBalance } from "./subscriberWalletService";
+import { creditCompanyWallet } from "./companyWalletService";
 
 export type CreateWhishClaimInput = {
   externalInvoiceId: number;
@@ -170,6 +171,15 @@ export async function confirmWhishPaymentClaim(
       referenceType: "whish_claim",
       referenceId: String(claim.id),
       note: `Whish ref ${reference}`,
+      createdBy: actorUsername,
+      manager,
+    });
+    await creditCompanyWallet({
+      amount: claim.amount,
+      currency: claim.currency,
+      referenceType: "whish_claim",
+      referenceId: String(claim.id),
+      note: `Whish top-up @${claim.username} ref ${reference}`,
       createdBy: actorUsername,
       manager,
     });

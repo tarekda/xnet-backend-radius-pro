@@ -26,6 +26,7 @@ import nasRoutes from './routes/nasRoutes';
 import cron from "node-cron";
 import { generateMonthlyInvoices } from './services/invoiceService';
 import { runExternalDunningSystemJob } from './controllers/invoiceController';
+import { evaluateAlertRules } from './alerts/evaluateAlertRules';
 import { SessionTrackingWatcher } from './watchers/SessionTrackingWatcher';
 import { WebSocket, WebSocketServer } from 'ws';
 import invoiceRoutes from './routes/invoiceRoutes';
@@ -37,10 +38,12 @@ import { subscriberAuthRoutes, subscriberApiRoutes } from './routes/subscriberRo
 import paymentGatewayRoutes, { paymentWebhookRoutes } from './routes/paymentGatewayRoutes';
 import accessRoutes from './routes/accessRoutes';
 import resellerRoutes from './routes/resellerRoutes';
+import companyWalletRoutes from './routes/companyWalletRoutes';
 import auditRoutes from './routes/auditRoutes';
 import backupRoutes from './routes/backupRoutes';
 import cableVisionRoutes from './routes/cableVisionRoutes';
 import aiRoutes from './routes/aiRoutes';
+import voucherRoutes from './routes/voucherRoutes';
 import whatsappWebhookRoutes, { whatsappTwilioWebhookRouter } from './routes/whatsappWebhookRoutes';
 import { setWsBroadcast } from './realtime/wsHub';
 import './events/invoiceListeners'
@@ -228,8 +231,10 @@ app.use("/api/access", accessRoutes);
 app.use("/api", auditRoutes);
 
 app.use("/api", resellerRoutes);
+app.use("/api", companyWalletRoutes);
 
 app.use("/api", backupRoutes);
+app.use("/api/vouchers", voucherRoutes);
 
 app.use("/api/cable-vision", cableVisionRoutes);
 app.use('/api', aiRoutes);
@@ -261,6 +266,7 @@ if (dunningTask) {
 
 /** Set after DB init — expiry job must not run before AppDataSource.initialize() completes. */
 let expiryDisconnectTask: ReturnType<typeof cron.schedule> | null = null;
+let alertEvalTask: ReturnType<typeof cron.schedule> | null = null;
 
 // RADIUS server setup
 const radiusServer = dgram.createSocket('udp4');
@@ -373,6 +379,22 @@ initializeDB().then(async () => {
       console.log(`[expiry-disconnect] scheduler enabled: ${expiryDisconnectCronExpr}`);
     }
 
+    const alertEvalCronExpr = String(process.env.ALERT_EVAL_CRON ?? "*/2 * * * *").trim();
+    if (alertEvalCronExpr && alertEvalCronExpr !== "off" && alertEvalCronExpr !== "0") {
+      try {
+        alertEvalTask = cron.schedule(alertEvalCronExpr, async () => {
+          try {
+            await evaluateAlertRules();
+          } catch (e) {
+            console.error("[alerts] eval failed", e);
+          }
+        });
+        console.log(`[alerts] evaluator enabled: ${alertEvalCronExpr}`);
+      } catch (e) {
+        console.error("[alerts] invalid ALERT_EVAL_CRON", e);
+      }
+    }
+
     const runOnStart = String(process.env.EXPIRY_DISCONNECT_RUN_ON_STARTUP ?? "").trim().toLowerCase();
     if (runOnStart === "1" || runOnStart === "true") {
       setTimeout(() => {
@@ -404,6 +426,9 @@ async function shutdown(signal: string) {
     } catch {}
     try {
       expiryDisconnectTask?.stop();
+    } catch {}
+    try {
+      alertEvalTask?.stop();
     } catch {}
 
     // Stop accepting new HTTP connections

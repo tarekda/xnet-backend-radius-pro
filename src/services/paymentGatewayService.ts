@@ -5,6 +5,7 @@ import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import { PaymentIntent } from "../db/entities/PaymentIntent";
 import { invoiceEvents } from "../events/invoiceEvents";
 import { payExternalInvoice } from "./invoiceService";
+import { writeAuditLog } from "../audit/writeAuditLog";
 import {
   createWhishPaymentInvoice,
   isWhishConfigured,
@@ -14,8 +15,15 @@ import {
 
 export type PaymentProvider = "stub" | "whish";
 
+function isProduction(): boolean {
+  return String(process.env.NODE_ENV || "").toLowerCase() === "production";
+}
+
 function webhookSecret(): string {
-  return process.env.PAYMENT_WEBHOOK_SECRET || process.env.JWT_SECRET || "dev-webhook-secret";
+  const dedicated = String(process.env.PAYMENT_WEBHOOK_SECRET || "").trim();
+  if (dedicated) return dedicated;
+  if (isProduction()) return "";
+  return "dev-webhook-secret";
 }
 
 function publicApiBase(): string {
@@ -209,7 +217,7 @@ export function verifyProviderWebhookAuth(opts: {
   secretParam?: string;
 }): boolean {
   const relaxed = String(process.env.PAYMENT_WEBHOOK_RELAXED || "").toLowerCase() === "1";
-  if (relaxed) return true;
+  if (relaxed && !isProduction()) return true;
   if (verifyWebhookSignature(opts.rawBody, opts.signature)) return true;
 
   if (opts.provider === "whish") {
@@ -256,11 +264,35 @@ export async function handlePaymentWebhook(
 
   const status = normalizeWebhookStatus(payload.status);
   if (status === "succeeded") {
-    await payExternalInvoice(intent.externalInvoiceId, "gateway", "gateway");
-    intent.status = "succeeded";
-    intent.updatedAt = new Date();
-    await repo.save(intent);
-  } else if (status === "failed") {
+    const claimed = await repo
+      .createQueryBuilder()
+      .update(PaymentIntent)
+      .set({ status: "processing", updatedAt: new Date() })
+      .where("id = :id", { id: intent.id })
+      .andWhere("status IN (:...open)", { open: ["pending", "failed"] })
+      .execute();
+    if (!claimed.affected) {
+      const latest = await repo.findOne({ where: { gatewayIntentId: Equal(gatewayIntentId) } });
+      if (latest?.status === "succeeded") return latest;
+      throw new Error("Payment is already being processed");
+    }
+    try {
+      await payExternalInvoice(intent.externalInvoiceId, "gateway", "gateway");
+      intent.status = "succeeded";
+      intent.updatedAt = new Date();
+      await repo.save(intent);
+      await writeAuditLog({
+        action: "billing.externalInvoice.pay",
+        actorUsername: "gateway",
+        meta: { invoiceId: intent.externalInvoiceId, gatewayIntentId, provider: normalizedProvider },
+      });
+    } catch (err) {
+      intent.status = "failed";
+      intent.updatedAt = new Date();
+      await repo.save(intent);
+      throw err;
+    }
+  } else if (status === "failed" && intent.status !== "processing") {
     intent.status = "failed";
     intent.updatedAt = new Date();
     await repo.save(intent);

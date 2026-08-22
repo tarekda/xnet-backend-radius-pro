@@ -7,6 +7,7 @@ import { SystemUsers } from "../db/entities/SystemUsers";
 import { RefreshTokens } from "../db/entities/RefreshTokens";
 import { getEffectivePermissionsForUser } from "../access/permissionService";
 import { getJwtSecret, getRefreshTokenSecret } from "../config/requireSecrets";
+import { clearStaffLoginFailures, getStaffLoginLock, recordStaffLoginFailure } from "../auth/staffLoginLockout";
 
 const jwtSecret = getJwtSecret();
 const refreshTokenSecret = getRefreshTokenSecret();
@@ -53,13 +54,25 @@ export const mobileLogin: RequestHandler = async (req, res) => {
 
   try {
     const lookup = username.trim().toLowerCase();
+    const lock = await getStaffLoginLock(lookup);
+    if (lock.locked) {
+      res.status(423).json({ message: lock.message || "Account locked" });
+      return;
+    }
+
     const user = await userRepository.findOne({ where: { username: Equal(lookup) } });
 
     if (!user || !(await bcrypt.compare(password, user.password))) {
+      const next = await recordStaffLoginFailure(lookup);
+      if (next.locked) {
+        res.status(423).json({ message: next.message || "Account locked" });
+        return;
+      }
       res.status(401).json({ message: "Invalid credentials" });
       return;
     }
 
+    await clearStaffLoginFailures(lookup);
     const { completeLoginAfterPassword } = await import("./mfaController");
     await completeLoginAfterPassword(user, res, "mobile");
     return;
