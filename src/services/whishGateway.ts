@@ -103,3 +103,30 @@ export function resolveWhishAmount(amountUsd: number, currency: WhishCurrency): 
   }
   return Math.round(amountUsd * rate);
 }
+
+/** 
+ * Mock polling for Whish transaction claims verification. 
+ * In production this would query the Codnloc/Whish API for transaction status.
+ */
+export async function checkWhishTransactionStatus(reference: string): Promise<{ status: "paid" | "pending" | "failed", amount?: number }> {
+  if (!isWhishConfigured()) {
+    return { status: "pending" }; // Skip polling if not configured
+  }
+  
+  // Simulate API delay
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  
+  // Mock logic: 
+  // If reference ends with 'fail', reject it.
+  // If reference is older than random threshold, approve it to simulate async payments.
+  if (reference.toLowerCase().endsWith("fail")) {
+    return { status: "failed" };
+  }
+  
+  // 30% chance of being paid in this polling cycle
+  if (Math.random() > 0.7) {
+    return { status: "paid" };
+  }
+  
+  return { status: "pending" };
+}

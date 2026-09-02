@@ -18,6 +18,9 @@ router.get('/summary', asyncHandler(bandwidthController.getBandwidthSummary.bind
 // Get traffic data for all interfaces
 router.get('/interfaces', asyncHandler(bandwidthController.getInterfaceTraffic.bind(bandwidthController)));
 
+// Get CCR neighbors
+router.get('/neighbors', asyncHandler(bandwidthController.getNeighbors.bind(bandwidthController)));
+
 // Get historical traffic data for a specific interface
 router.get('/historical', asyncHandler(bandwidthController.getHistoricalTraffic.bind(bandwidthController)));
 

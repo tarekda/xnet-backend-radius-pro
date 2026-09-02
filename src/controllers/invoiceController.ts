@@ -45,6 +45,7 @@ import { composePaidMessage, sendWhatsAppMessage, sendWhatsAppMessageStrict, get
 import { createPaymentIntent, getOpenCheckoutUrl } from "../services/paymentGatewayService";
 import { BadRequestError, coerceToAppError } from "../errors/AppError";
 import { recordDunningRun } from "../metrics/metrics";
+import { invoiceDue, remainingDue } from "../billing/paymentMath";
 import { importExternalInvoices, adjustPreviewForUsernameFilter, filterInvoicesByUsernames, parseImportUsernameFilter } from "../services/externalInvoiceImportService";
 import type { ImportPreviewResult } from "../services/externalInvoiceImportParser";
 import { fetchMyISPInvoices } from "../services/myispInvoiceService";
@@ -101,7 +102,12 @@ type DunningCandidate = {
   phoneNumber: string;
   status: string;
   billingMonth: string;
+  /** Full billed amount (totalAmount when set, else amount). */
   amount: number;
+  /** Cumulative collected so far. */
+  amountPaid: number;
+  /** What the customer still owes — this is what dunning chases, not `amount`. */
+  remainingDue: number;
   overdueDays: number;
   dueDate: string;
 };
@@ -153,7 +159,8 @@ const buildReminderMessage = (invoice: DunningCandidate) =>
     fullName: invoice.fullName,
     username: invoice.username,
     invoiceId: invoice.id,
-    amount: invoice.amount,
+    // Quote what is still owed; a partially paid invoice must not ask for the full amount again.
+    amount: invoice.remainingDue,
     billingMonth: invoice.billingMonth,
     status: invoice.status,
   });
@@ -244,7 +251,7 @@ const applyDunningAction = async (params: {
           fullName: params.invoice.fullName,
           username: params.invoice.username,
           invoiceId: params.invoice.id,
-          amount: params.invoice.amount,
+          amount: params.invoice.remainingDue,
           billingMonth: params.invoice.billingMonth,
           status: params.invoice.status,
         }),
@@ -304,16 +311,37 @@ const getDunningCandidates = async (params: {
     .where("ext.deletedAt IS NULL")
     .andWhere("ext.voidedAt IS NULL")
     .andWhere("ext.status IN (:...statuses)", { statuses })
+    // Credit notes are settlement documents, never something to chase.
+    .andWhere("ext.documentType != :creditNote", { creditNote: "credit_note" })
+    // An invoice with a live credit note against it has been written off.
+    .andWhere((qb) => {
+      const sub = qb
+        .subQuery()
+        .select("1")
+        .from(ExternalInvoice, "note")
+        .where("note.parentInvoiceId = ext.id")
+        .andWhere("note.documentType = :creditNote")
+        .andWhere("note.voidedAt IS NULL")
+        .andWhere("note.deletedAt IS NULL")
+        .getQuery();
+      return `NOT EXISTS ${sub}`;
+    })
     .orderBy("ext.billingMonth", "ASC")
     .take(Math.max(params.limit * 5, params.limit))
     .getMany();
 
   const filtered = rows
     .filter((inv) => !inv.deletedAt)
-    .filter((inv) => Number(inv.amount || 0) >= params.minAmount)
     .map((inv) => {
       const billingMonth = new Date(inv.billingMonth as any);
       if (Number.isNaN(billingMonth.getTime())) return null;
+      // Chase the outstanding balance, not the billed total: a partially paid invoice
+      // stays `pending` (see applyInvoicePayment) and must be dunned for what is left.
+      const due = invoiceDue(inv);
+      const amountPaid = Number(inv.amountPaid || 0);
+      const remaining = remainingDue(due, amountPaid);
+      if (remaining < 0.01) return null;
+      if (remaining < params.minAmount) return null;
       const { dueDate, overdueDays } = computeDunningDates(billingMonth, params.graceDays, params.asOfDate);
       // Immediate mode: when graceDays is 0, include unpaid/pending invoices right away.
       if (params.graceDays > 0 && overdueDays < 0) return null;
@@ -324,13 +352,15 @@ const getDunningCandidates = async (params: {
         phoneNumber: String(inv.phoneNumber || "").trim(),
         status: String(inv.status || "unpaid"),
         billingMonth: String(inv.billingMonth || ""),
-        amount: Number(inv.amount || 0),
+        amount: due,
+        amountPaid,
+        remainingDue: remaining,
         overdueDays: Math.max(0, overdueDays),
         dueDate: dueDate.toISOString(),
       } as DunningCandidate;
     })
     .filter((x): x is DunningCandidate => Boolean(x))
-    .sort((a, b) => (b.overdueDays - a.overdueDays) || (b.amount - a.amount));
+    .sort((a, b) => (b.overdueDays - a.overdueDays) || (b.remainingDue - a.remainingDue));
 
   return filtered.slice(0, params.limit);
 };
@@ -946,6 +976,14 @@ export const previewTerraInvoicesHandler = (req: Request, res: Response) =>
   previewHsiProvider('terra', req, res);
 export const importTerraInvoicesHandler = (req: Request, res: Response) =>
   importHsiProvider('terra', req, res);
+export const previewTerra2InvoicesHandler = (req: Request, res: Response) =>
+  previewHsiProvider('terra2', req, res);
+export const importTerra2InvoicesHandler = (req: Request, res: Response) =>
+  importHsiProvider('terra2', req, res);
+export const previewMispInvoicesHandler = (req: Request, res: Response) =>
+  previewHsiProvider('misp', req, res);
+export const importMispInvoicesHandler = (req: Request, res: Response) =>
+  importHsiProvider('misp', req, res);
 
 // ... existing code ...
 
@@ -1528,7 +1566,8 @@ export const getExternalDunningPreviewHandler = async (req: Request, res: Respon
     const candidates = await getDunningCandidates({ statuses, graceDays, limit, minAmount, asOfDate });
     const withoutPhone = candidates.filter((c) => !c.phoneNumber).length;
     const readyToSend = candidates.length - withoutPhone;
-    const totalAmount = candidates.reduce((acc, c) => acc + Number(c.amount || 0), 0);
+    // The collectible figure is what is still owed, not the sum of billed totals.
+    const totalAmount = candidates.reduce((acc, c) => acc + Number(c.remainingDue || 0), 0);
     const actionSummary = {
       remind: 0,
       throttle: 0,

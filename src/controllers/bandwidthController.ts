@@ -22,6 +22,23 @@ export class BandwidthController {
     }
   }
 
+  async getNeighbors(req: Request, res: Response) {
+    try {
+      const neighbors = await bandwidthService.getNeighbors();
+      res.json({
+        success: true,
+        data: neighbors
+      });
+    } catch (error) {
+      logger.error('Error getting CCR neighbors:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to fetch neighbors data',
+        message: error instanceof Error ? error.message : 'Unknown error'
+      });
+    }
+  }
+
   async getInterfaceTraffic(req: Request, res: Response) {
     try {
       const traffic = await bandwidthService.getInterfaceTraffic();

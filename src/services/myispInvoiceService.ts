@@ -90,7 +90,7 @@ function loadConfig(account: MyISPAccount): MyISPConfig {
   const prefix = `MYISP_${account}_`;
   const legacy = (name: string) => (account === 1 ? process.env[`MYISP_${name}`] : undefined);
   const username = String(process.env[`${prefix}USERNAME`] || legacy('USERNAME') || '').trim();
-  const password = String(process.env[`${prefix}PASSWORD`] || legacy('PASSWORD') || '');
+  const password = String(process.env[`${prefix}PASSWORD`] || legacy('PASSWORD') || '').trim();
   if (!username || !password) {
     throw new AppError(
       'MyISP integration is not configured',
@@ -322,6 +322,19 @@ async function requestWithCookies(
       response.status === 303 ||
       ((response.status === 301 || response.status === 302) &&
         String(config.method || 'get').toLowerCase() === 'post');
+    let redirectHeaders = config.headers;
+    if (switchToGet && redirectHeaders) {
+      redirectHeaders = { ...redirectHeaders };
+      delete redirectHeaders['Content-Type'];
+      delete redirectHeaders['content-type'];
+      delete redirectHeaders['Content-Length'];
+      delete redirectHeaders['content-length'];
+      delete redirectHeaders['Origin'];
+      delete redirectHeaders['origin'];
+      delete redirectHeaders['X-Requested-With'];
+      delete redirectHeaders['x-requested-with'];
+    }
+
     return requestWithCookies(
       client,
       jar,
@@ -330,6 +343,7 @@ async function requestWithCookies(
         url: redirectedUrl,
         method: switchToGet ? 'get' : config.method,
         data: switchToGet ? undefined : config.data,
+        headers: redirectHeaders,
       },
       redirectsRemaining - 1
     );
@@ -349,69 +363,164 @@ function assertSuccessful(response: AxiosResponse, operation: string): void {
   }
 }
 
+/** Fast path: login → CSV only, no MAC address pagination loop. */
+async function fetchMyISPCsvFast(account: MyISPAccount): Promise<Buffer> {
+  const { client, cookieStr, resellerId } = await fetchMyISPSession(account);
+
+  const exportResponse = await client.get('/export-users.php', {
+    params: { resellerId },
+    headers: { 'Cookie': cookieStr },
+    responseType: 'arraybuffer',
+    maxRedirects: 0,
+    validateStatus: () => true,
+  });
+  assertSuccessful(exportResponse, 'export');
+  const contentType = String(exportResponse.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (contentType !== 'text/csv') {
+    throw new AppError('MyISP returned an unexpected export format', 502, 'MYISP_INVALID_EXPORT', true);
+  }
+  return Buffer.from(exportResponse.data);
+}
+
+/**
+ * Shared login helper: authenticates and returns a ready-to-use session.
+ * Returns the axios client with the session cookie and the reseller page CSRF token.
+ */
+async function fetchMyISPSession(account: MyISPAccount): Promise<{
+  client: AxiosInstance;
+  cookieStr: string;
+  pageCsrf: string;
+  resellerId: string;
+  config: MyISPConfig;
+}> {
+  const config = loadConfig(account);
+  const client = axios.create({
+    baseURL: config.baseUrl,
+    timeout: 30000,
+    responseType: 'text',
+    transitional: { forcedJSONParsing: false },
+    httpsAgent: new (require('https')).Agent({ keepAlive: false }),
+  });
+
+  const loginPage = await client.get('/login.php');
+  assertSuccessful(loginPage, 'login');
+  const csrfToken = extractCsrfToken(String(loginPage.data || ''));
+  if (!csrfToken) {
+    throw new AppError('MyISP login page did not contain a CSRF token', 502, 'MYISP_LOGIN_CHANGED', true);
+  }
+
+  let cookies: string[] = loginPage.headers['set-cookie'] || [];
+  let cookieStr = cookies.map((c) => c.split(';')[0]).join('; ');
+
+  const form = new URLSearchParams();
+  form.append('login_username', config.username);
+  form.append('login_password', config.password);
+  form.append('captcha', '');
+  form.append('csrf_token', csrfToken);
+
+  const formHeaders = { 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': cookieStr };
+
+  const checkLogin = await client.post('/checklogin.php', form.toString(), {
+    headers: { ...formHeaders, 'X-Requested-With': 'XMLHttpRequest' },
+    maxRedirects: 0,
+    validateStatus: () => true,
+  });
+  assertSuccessful(checkLogin, 'authentication');
+
+  const loginSubmit = await client.post('/login.php', form.toString(), {
+    headers: formHeaders,
+    maxRedirects: 0,
+    validateStatus: () => true,
+  });
+  if (loginSubmit.headers['set-cookie']) {
+    cookies = cookies.concat(loginSubmit.headers['set-cookie']);
+    cookieStr = cookies.map((c) => c.split(';')[0]).join('; ');
+  }
+
+  const usersPage = await client.get('/resellerUsers.php', {
+    headers: { 'Cookie': cookieStr },
+    maxRedirects: 5,
+    validateStatus: () => true,
+  });
+  if (!String(usersPage.data || '').includes('export-users.php')) {
+    throw new AppError('MyISP authentication failed', 502, 'MYISP_AUTH_FAILED', true);
+  }
+
+  const resellerId = config.resellerId || extractResellerId(String(usersPage.data));
+  if (!resellerId) {
+    throw new AppError('MyISP reseller ID could not be determined', 502, 'MYISP_RESELLER_ID_MISSING', true);
+  }
+
+  const pageCsrfMatch =
+    /meta\s+name=["']csrf-token["']\s+content=["']([^"']+)/i.exec(String(usersPage.data)) ||
+    /meta\s+content=["']([^"']+)["']\s+name=["']csrf-token["']/i.exec(String(usersPage.data));
+  const pageCsrf = pageCsrfMatch?.[1] || csrfToken;
+
+  return { client, cookieStr, pageCsrf, resellerId, config };
+}
+
 async function fetchAuthenticatedExport(account: MyISPAccount): Promise<MyISPExport> {
   const config = loadConfig(account);
   const client = axios.create({
     baseURL: config.baseUrl,
-    timeout: config.timeoutMs,
+    timeout: 60000,
     responseType: 'text',
     transitional: { forcedJSONParsing: false },
+    httpsAgent: new (require('https')).Agent({ keepAlive: false }),
   });
   const jar = new CookieJar();
 
   try {
     let usersHtml = '';
+    let finalCookies: string[] = [];
+    let cookieStr = '';
+    
     for (let cycle = 0; cycle < 2; cycle += 1) {
-      const loginPage = await requestWithCookies(client, jar, {
-        method: 'get',
-        url: '/login.php',
-      });
+      const loginPage = await client.get('/login.php');
       assertSuccessful(loginPage, 'login');
       const csrfToken = extractCsrfToken(String(loginPage.data || ''));
       if (!csrfToken) {
-        throw new AppError(
-          'MyISP login page did not contain a CSRF token',
-          502,
-          'MYISP_LOGIN_CHANGED',
-          true
-        );
+        throw new AppError('MyISP login page did not contain a CSRF token', 502, 'MYISP_LOGIN_CHANGED', true);
       }
 
-      const form = new URLSearchParams({
-        login_username: config.username,
-        login_password: config.password,
-        captcha: '',
-        csrf_token: csrfToken,
-      });
+      finalCookies = loginPage.headers['set-cookie'] || [];
+      cookieStr = finalCookies.map(c => c.split(';')[0]).join('; ');
+
+      const form = new URLSearchParams();
+      form.append('login_username', config.username);
+      form.append('login_password', config.password);
+      form.append('captcha', '');
+      form.append('csrf_token', csrfToken);
+      
       const formHeaders = {
         'Content-Type': 'application/x-www-form-urlencoded',
-        Referer: `${config.baseUrl}/login.php`,
-        Origin: new URL(config.baseUrl).origin,
-        'X-CSRF-Token': csrfToken,
+        'Cookie': cookieStr,
       };
-      const checkLogin = await requestWithCookies(client, jar, {
-        method: 'post',
-        url: '/checklogin.php',
-        data: form.toString(),
-        headers: {
-          ...formHeaders,
-          'X-Requested-With': 'XMLHttpRequest',
-        },
+
+      const checkLogin = await client.post('/checklogin.php', form.toString(), {
+        headers: { ...formHeaders, 'X-Requested-With': 'XMLHttpRequest' },
+        maxRedirects: 0,
+        validateStatus: () => true
       });
       assertSuccessful(checkLogin, 'authentication');
 
-      const loginSubmit = await requestWithCookies(client, jar, {
-        method: 'post',
-        url: '/login.php',
-        data: form.toString(),
+      const loginSubmit = await client.post('/login.php', form.toString(), {
         headers: formHeaders,
+        maxRedirects: 0,
+        validateStatus: () => true
       });
-      assertSuccessful(loginSubmit, 'authentication');
+      
+      if (loginSubmit.headers['set-cookie']) {
+        finalCookies = finalCookies.concat(loginSubmit.headers['set-cookie']);
+        cookieStr = finalCookies.map(c => c.split(';')[0]).join('; ');
+      }
 
-      const usersPage = await requestWithCookies(client, jar, {
-        method: 'get',
-        url: '/resellerUsers.php',
+      const usersPage = await client.get('/resellerUsers.php', {
+        headers: { 'Cookie': cookieStr },
+        maxRedirects: 5,
+        validateStatus: () => true
       });
+
       if (
         usersPage.status >= 200 &&
         usersPage.status < 300 &&
@@ -430,6 +539,9 @@ async function fetchAuthenticatedExport(account: MyISPAccount): Promise<MyISPExp
         true
       );
     }
+    
+    // Populate the cookie jar for subsequent requests
+    jar.update(finalCookies);
 
     const resellerId = config.resellerId || extractResellerId(usersHtml);
     if (!resellerId) {
@@ -443,16 +555,42 @@ async function fetchAuthenticatedExport(account: MyISPAccount): Promise<MyISPExp
 
     let providerMacByUsername = new Map<string, string>();
     try {
-      providerMacByUsername = await fetchProviderMacMap(client, jar, config, usersHtml);
+      const csrf = extractPageCsrfToken(usersHtml);
+      if (csrf) {
+        const pageSize = 500;
+        for (let start = 0; start < 100_000; start += pageSize) {
+          const macRes = await client.post('/admingetresellerusers.php', dataTableForm(start, pageSize).toString(), {
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+              "X-Requested-With": "XMLHttpRequest",
+              "X-CSRF-Token": csrf,
+              "Origin": new URL(config.baseUrl).origin,
+              "Referer": `${config.baseUrl}/resellerUsers.php`,
+              "Cookie": cookieStr
+            },
+            validateStatus: () => true
+          });
+          if (macRes.status < 200 || macRes.status >= 300) break;
+          let payload: any;
+          try { payload = typeof macRes.data === 'string' ? JSON.parse(macRes.data) : macRes.data; } catch { break; }
+          if (payload?.redirect || payload?.error) break;
+          const rows = dataTableRows(payload);
+          for (const [u, m] of mapMyISPProviderMacRows(rows)) providerMacByUsername.set(u, m);
+          const total = Number(payload?.recordsFiltered ?? payload?.recordsTotal);
+          if (rows.length === 0 || rows.length < pageSize) break;
+          if (Number.isFinite(total) && start + rows.length >= total) break;
+        }
+      }
     } catch {
       // MAC enrichment is best-effort and must not block the invoice import.
     }
 
-    const exportResponse = await requestWithCookies(client, jar, {
-      method: 'get',
-      url: '/export-users.php',
+    const exportResponse = await client.get('/export-users.php', {
       params: { resellerId },
+      headers: { 'Cookie': cookieStr },
       responseType: 'arraybuffer',
+      maxRedirects: 0,
+      validateStatus: () => true
     });
     assertSuccessful(exportResponse, 'export');
     const contentType = String(exportResponse.headers['content-type'] || '')
@@ -649,4 +787,85 @@ export async function fetchMyISPProviderMacAddresses(
 ): Promise<Map<string, string>> {
   const { providerMacByUsername } = await fetchAuthenticatedExport(account);
   return providerMacByUsername;
+}
+
+/**
+ * Fast subscriber fetch for the External Users page.
+ * Uses admingetresellerusers.php DataTable API which embeds live online status
+ * in the userfname column HTML: <td title="Online"> or <td title="Offline">.
+ * Returns ALL rows (including expired/blocked) with accurate real-time online status.
+ */
+export async function fetchMyISPRawUsers(
+  account: MyISPAccount = 1
+): Promise<{ username: string; fullName: string; email: string; phoneNumber: string; address: string | null; plan: string | null; expiryDate: string | null; macAddress: string | null; online: boolean }[]> {
+  const { client, cookieStr, pageCsrf, config } = await fetchMyISPSession(account);
+
+  const origin = new URL(config.baseUrl).origin;
+  const referer = `${config.baseUrl}/resellerUsers.php`;
+  const pageSize = 500;
+  const allUsers: { username: string; fullName: string; email: string; phoneNumber: string; address: string | null; plan: string | null; expiryDate: string | null; macAddress: string | null; online: boolean }[] = [];
+
+  for (let start = 0; start < 100_000; start += pageSize) {
+    const res = await client.post('/admingetresellerusers.php', dataTableForm(start, pageSize).toString(), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-CSRF-Token': pageCsrf,
+        Origin: origin,
+        Referer: referer,
+        Cookie: cookieStr,
+      },
+      validateStatus: () => true,
+    });
+
+    if (res.status < 200 || res.status >= 300) break;
+    let payload: any;
+    try { payload = typeof res.data === 'string' ? JSON.parse(res.data) : res.data; } catch { break; }
+    if (payload?.redirect || payload?.error) break;
+
+    const rows = dataTableRows(payload);
+    if (rows.length === 0) break;
+
+    for (const row of rows) {
+      // Username is wrapped in <b> tags: "<b>xnet12</b>"
+      const usernameRaw = String(rowValue(row, 3, ['username', 'userName']) ?? '');
+      const username = usernameRaw.replace(/<[^>]*>/g, '').trim();
+      if (!username) continue;
+
+      // Online status is in the title attribute of the <td> wrapping userfname:
+      // <td title=Online><strong><p class="text-success">Name</p></strong></td>
+      const userFnameRaw = String(rowValue(row, 4, ['userfname']) ?? '');
+      const titleMatch = /title\s*=\s*["']?(Online|Offline)["']?/i.exec(userFnameRaw);
+      const online = titleMatch ? titleMatch[1].toLowerCase() === 'online' : false;
+      const fullName = userFnameRaw.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+
+      // Expiry date is also HTML-wrapped: <td><p>2026-09-15 12:30:00</p></td>
+      const expiryRaw = String(rowValue(row, 8, ['expirydate']) ?? '');
+      const expiryClean = expiryRaw.replace(/<[^>]*>/g, '').trim();
+      const expiryDate = expiryClean ? parsePayDueValue(expiryClean) : null;
+
+      const phoneRaw = String(rowValue(row, 9, ['phonenumber', 'mobilenumber']) ?? '').replace(/<[^>]*>/g, '').trim();
+      const mobileRaw = String(rowValue(row, 10, ['mobilenumber', 'phonenumber']) ?? '').replace(/<[^>]*>/g, '').trim();
+      const phoneNumber = mobileRaw || phoneRaw || '';
+
+      const emailRaw = String(rowValue(row, 14, ['email']) ?? '').replace(/<[^>]*>/g, '').trim();
+      const addressParts = [
+        String(rowValue(row, 15, ['address']) ?? '').replace(/<[^>]*>/g, '').trim(),
+        String(rowValue(row, 16, ['address2', 'building']) ?? '').replace(/<[^>]*>/g, '').trim(),
+      ].filter(Boolean);
+      const address = addressParts.join(', ') || null;
+
+      const planRaw = String(rowValue(row, 2, ['planname', 'plan']) ?? '').replace(/<[^>]*>/g, '').trim();
+      const ipRaw = String(rowValue(row, 7, ['ip', 'staticip']) ?? '').replace(/<[^>]*>/g, '').trim();
+      const macAddress = extractMacAddress(ipRaw);
+
+      allUsers.push({ username, fullName, email: emailRaw, phoneNumber, address, plan: planRaw || null, expiryDate, macAddress, online });
+    }
+
+    const total = Number(payload?.recordsFiltered ?? payload?.recordsTotal);
+    if (rows.length < pageSize) break;
+    if (Number.isFinite(total) && start + rows.length >= total) break;
+  }
+
+  return allUsers;
 }

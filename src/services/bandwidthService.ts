@@ -355,6 +355,27 @@ export class BandwidthService {
   }
 
   /* ------------------------------------------------------------------
+   * Neighbors
+   * ------------------------------------------------------------------*/
+  async getNeighbors(): Promise<any[]> {
+    if (this.mockMode) return this.generateMockNeighbors();
+
+    await this.ensureConnection();
+    const neighbors = (await this.withTimeout(
+      this.conn.write('/ip/neighbor/print'),
+      this.commandTimeoutMs,
+      'ip neighbor'
+    ).catch((e: any) => {
+      logger.warn('getNeighbors failed:', e?.message || e);
+      this.resetConnection();
+      return [];
+    })) as any[];
+    
+    return neighbors;
+  }
+
+
+  /* ------------------------------------------------------------------
    * User traffic
    * ------------------------------------------------------------------*/
   async getUserTraffic(username: string): Promise<any> {
@@ -468,6 +489,38 @@ export class BandwidthService {
       'mac-address': `00:11:22:33:44:${(50 + i).toString(16).padStart(2, '0')}`
     }));
     return { pppConnections: ppp, dhcpConnections: dhcp, totalActiveConnections: ppp.length + dhcp.length };
+  }
+
+  private generateMockNeighbors() {
+    return [
+      {
+        interface: "ether1",
+        "mac-address": "00:11:22:33:44:55",
+        identity: "Dist-North (CCR1009)",
+        platform: "MikroTik",
+        "board-name": "CCR1009-7G-1C-1S+",
+        "system-description": "RouterOS CCR1009-7G-1C-1S+",
+        "ipv4-address": "10.0.1.1"
+      },
+      {
+        interface: "sfp-sfpplus1",
+        "mac-address": "00:11:22:33:44:66",
+        identity: "Dist-South (CCR1009)",
+        platform: "MikroTik",
+        "board-name": "CCR1009-7G-1C-1S+",
+        "system-description": "RouterOS CCR1009-7G-1C-1S+",
+        "ipv4-address": "10.0.2.1"
+      },
+      {
+        interface: "ether2",
+        "mac-address": "AA:BB:CC:DD:EE:FF",
+        identity: "OLT-ZTE-C320",
+        platform: "ZTE",
+        "board-name": "ZTE C320",
+        "system-description": "ZTE OLT C320",
+        "ipv4-address": "10.0.5.1"
+      }
+    ];
   }
 
   private generateMockUserTraffic(username: string) {

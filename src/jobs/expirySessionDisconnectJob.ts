@@ -1,12 +1,22 @@
 import { AppDataSource } from "../db/config";
-import { Radacct } from "../db/entities/Radacct";
 import { Raduserprofile } from "../db/entities/Raduserprofile";
+import { Settings } from "../db/entities/Settings";
 import { UserController } from "../controllers/userController";
 import cacheService from "../services/cacheService";
 
 /**
  * Bulk-flip account_status to expired when expires_at has passed (active rows only),
- * then disconnect still-online sessions so the NAS drops them (RADIUS rejects expired logins).
+ * then disconnect still-online sessions that still carry a pre-expiry (full-internet)
+ * auth so they re-authenticate.
+ *
+ * When Walled-Garden-expired is on, RADIUS accepts those re-auths into quarantine.
+ * Only the latest open radacct row per username is considered — older zombie rows with
+ * acctstoptime IS NULL would otherwise make every tick look like a pre-expiry session
+ * and flap the CPE every cron interval.
+ *
+ * When the garden is off, RADIUS rejects expired logins, so every open session with
+ * a past expires_at is still a leak and gets disconnected (legacy behaviour).
+ *
  * Gated by EXPIRY_DISCONNECT_CRON in server.ts.
  */
 export async function runExpirySessionDisconnectJob(): Promise<{
@@ -15,10 +25,11 @@ export async function runExpirySessionDisconnectJob(): Promise<{
   attempted: number;
   ok: number;
   failed: number;
+  skippedGarden: number;
 }> {
   if (!AppDataSource.isInitialized) {
     console.warn("[expiry-disconnect] skipped: database not initialized yet");
-    return { statusFlipped: 0, candidates: 0, attempted: 0, ok: 0, failed: 0 };
+    return { statusFlipped: 0, candidates: 0, attempted: 0, ok: 0, failed: 0, skippedGarden: 0 };
   }
 
   const flip = await AppDataSource.getRepository(Raduserprofile)
@@ -50,23 +61,64 @@ export async function runExpirySessionDisconnectJob(): Promise<{
   const batchRaw = parseInt(process.env.EXPIRY_DISCONNECT_BATCH || "100", 10);
   const batch = Number.isFinite(batchRaw) && batchRaw > 0 ? Math.min(batchRaw, 500) : 100;
 
-  // Open radacct rows only (acctstoptime IS NULL). Do NOT apply ONLINE_SESSION_STALE_SECONDS here:
-  // interim accounting can easily be older than 5 minutes, and those users would never disconnect.
+  const gardenRow = await AppDataSource.getRepository(Settings)
+    .createQueryBuilder("s")
+    .select("s.ifEnabled", "ifEnabled")
+    .where("s.keyAttribute = :key", { key: "Walled-Garden-expired" })
+    .getRawOne<{ ifEnabled: number | boolean | null }>();
+  const gardenOn = Number(gardenRow?.ifEnabled) === 1;
 
-  const rows = await AppDataSource.getRepository(Radacct)
-    .createQueryBuilder("ra")
-    .select("ra.username", "username")
-    .distinct(true)
-    .innerJoin(Raduserprofile, "up", "up.username = ra.username")
-    .where("ra.acctstoptime IS NULL")
-    .andWhere("up.expiresAt IS NOT NULL")
-    .andWhere("up.expiresAt < CURRENT_TIMESTAMP")
-    .limit(batch)
-    .getRawMany<{ username: string }>();
+  // Latest open session only. Zombie acctstoptime IS NULL rows from months ago must not
+  // make a freshly re-authed garden session look "pre-expiry" forever.
+  const gardenClause = gardenOn
+    ? "AND ra.acctstarttime IS NOT NULL AND ra.acctstarttime < up.expires_at"
+    : "";
+
+  const rows: Array<{ username: string }> = await AppDataSource.query(
+    `
+    SELECT DISTINCT ra.username AS username
+      FROM radacct ra
+      INNER JOIN raduserprofile up ON up.username = ra.username
+     WHERE ra.acctstoptime IS NULL
+       AND ra.acctstarttime = (
+             SELECT MAX(ra2.acctstarttime)
+               FROM radacct ra2
+              WHERE ra2.username = ra.username
+                AND ra2.acctstoptime IS NULL
+           )
+       AND up.expires_at IS NOT NULL
+       AND up.expires_at < CURRENT_TIMESTAMP
+       ${gardenClause}
+     LIMIT ?
+    `,
+    [batch]
+  );
 
   const usernames = Array.from(
     new Set(rows.map((r) => String(r?.username ?? "").trim()).filter((u) => u.length > 0))
   );
+
+  let skippedGarden = 0;
+  if (gardenOn) {
+    const openRows: Array<{ cnt: number | string }> = await AppDataSource.query(
+      `
+      SELECT COUNT(DISTINCT ra.username) AS cnt
+        FROM radacct ra
+        INNER JOIN raduserprofile up ON up.username = ra.username
+       WHERE ra.acctstoptime IS NULL
+         AND ra.acctstarttime = (
+               SELECT MAX(ra2.acctstarttime)
+                 FROM radacct ra2
+                WHERE ra2.username = ra.username
+                  AND ra2.acctstoptime IS NULL
+             )
+         AND up.expires_at IS NOT NULL
+         AND up.expires_at < CURRENT_TIMESTAMP
+      `
+    );
+    const openCount = Number(openRows?.[0]?.cnt ?? 0) || 0;
+    skippedGarden = Math.max(0, openCount - usernames.length);
+  }
 
   let ok = 0;
   let failed = 0;
@@ -76,7 +128,15 @@ export async function runExpirySessionDisconnectJob(): Promise<{
     else failed += 1;
   }
 
-  const out = { statusFlipped, candidates: usernames.length, attempted: usernames.length, ok, failed };
+  const out = {
+    statusFlipped,
+    candidates: usernames.length,
+    attempted: usernames.length,
+    ok,
+    failed,
+    skippedGarden,
+    gardenOn,
+  };
   console.log("[expiry-disconnect] tick", out);
-  return out;
+  return { statusFlipped, candidates: usernames.length, attempted: usernames.length, ok, failed, skippedGarden };
 }

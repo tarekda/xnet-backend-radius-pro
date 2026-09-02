@@ -27,6 +27,7 @@ import { parseDateOnlyField, sqlMonthlyCycleResetAt, sqlMonthlyCycleStart } from
 import { getQuotaUsageForUsers } from '../utils/quotaUsage';
 import { readOnlineSessionConfig, sqlRadacctIsOnline, sqlRadacctLastUpdate } from '../utils/onlineSessionPolicy';
 import { Brackets } from 'typeorm';
+import { radiusAuthCacheService } from '../services/radiusAuthCacheService';
 
 
 
@@ -113,7 +114,8 @@ const deleteCacheKeys = async () => {
             "users_page_*",      // For paginated user lists
             "users_status_*",    // For user online status
             "user:*",            // For individual user caches
-            "user_search_*"      // For search results
+            "user_search_*",     // For search results
+            "radius:auth:*"      // For RADIUS AAA authentication caches
         ];
 
         for (const pattern of patterns) {
@@ -550,7 +552,7 @@ export const UserController = {
         body('username').isString().notEmpty(),
         body('password').isString().notEmpty(),
         body('profileId').isInt().notEmpty(),
-        body('accountStatus').optional().isString().isIn(["active", "suspended", "terminated", "expired"]),
+        body('accountStatus').optional().isString().isIn(["active", "suspended", "terminated", "expired", "blocked", "disabled"]),
         body('expiresAt').optional().isString(),
         body('expiryFramedIp').optional().isString(),
         body('freenight').optional().isBoolean(),
@@ -668,7 +670,7 @@ export const UserController = {
         body('username').isString().notEmpty(), // Username is required
         body('password').optional().isString().notEmpty(), // Password is optional
         body('profileId').optional().isInt(), // Profile ID is optional
-        body('accountStatus').optional().isString().isIn(["active", "suspended", "terminated", "expired"]), // Validate account status
+        body('accountStatus').optional().isString().isIn(["active", "suspended", "terminated", "expired", "blocked", "disabled"]), // Validate account status
         body("expiresAt").optional(),
         body("expiryFramedIp").optional(),
         body('freenight').optional().isBoolean(), // Free-night toggle is optional

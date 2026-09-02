@@ -17,5 +17,5 @@ ENGINE = MergeTree
 PARTITION BY toDate(ts)
 ORDER BY (username, ts, dst_ip, dst_port)
 TTL ts + INTERVAL 30 DAY
-SETTINGS index_granularity = 8192;
+SETTINGS index_granularity = 8192, max_suspicious_broken_parts = 10000;
 

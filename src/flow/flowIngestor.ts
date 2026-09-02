@@ -92,10 +92,20 @@ async function main() {
         values: rows,
       });
       inserted += rows.length;
-    } catch (err) {
-      // Put them back? For now just log and drop to avoid blocking.
-      // (You can later add a retry queue / disk buffer.)
+    } catch (err: any) {
       console.error("❌ ClickHouse insert failed:", err);
+      const errStr = String(err?.message || err) + String(err?.code || "");
+      if (errStr.includes("TOO_MANY_UNEXPECTED_DATA_PARTS") || String(err?.code) === "722") {
+        try {
+          console.log("🛠️ ClickHouse broken parts limit reached. Attaching table with expanded threshold...");
+          await ch.command({
+            query: `ATTACH TABLE user_flow_logs SETTINGS max_suspicious_broken_parts = 10000;`,
+          });
+          console.log("✅ ClickHouse table successfully attached and recovered!");
+        } catch (repairErr) {
+          console.error("❌ Auto-repair attach failed:", repairErr);
+        }
+      }
     }
   }
 

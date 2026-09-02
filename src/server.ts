@@ -44,6 +44,7 @@ import backupRoutes from './routes/backupRoutes';
 import cableVisionRoutes from './routes/cableVisionRoutes';
 import aiRoutes from './routes/aiRoutes';
 import voucherRoutes from './routes/voucherRoutes';
+import externalUsersRoutes from './routes/externalUsersRoutes';
 import whatsappWebhookRoutes, { whatsappTwilioWebhookRouter } from './routes/whatsappWebhookRoutes';
 import { setWsBroadcast } from './realtime/wsHub';
 import './events/invoiceListeners'
@@ -55,6 +56,7 @@ import { metricsMiddleware, register, setWebsocketClients } from './metrics/metr
 import { startBackupScheduler } from "./backups/scheduler";
 import { runExpirySessionDisconnectJob } from "./jobs/expirySessionDisconnectJob";
 import { startConnectionLogsMaintenanceScheduler } from "./jobs/connectionLogsMaintenance";
+import { runWhishClaimReconciliationJob } from "./jobs/whishClaimReconciliationJob";
 import { assertProductionSecrets, getJwtSecret, getRadiusSecret } from "./config/requireSecrets";
 import jwt from "jsonwebtoken";
 
@@ -235,6 +237,7 @@ app.use("/api", companyWalletRoutes);
 
 app.use("/api", backupRoutes);
 app.use("/api/vouchers", voucherRoutes);
+app.use("/api/external-users", externalUsersRoutes);
 
 app.use("/api/cable-vision", cableVisionRoutes);
 app.use('/api', aiRoutes);
@@ -267,6 +270,7 @@ if (dunningTask) {
 /** Set after DB init — expiry job must not run before AppDataSource.initialize() completes. */
 let expiryDisconnectTask: ReturnType<typeof cron.schedule> | null = null;
 let alertEvalTask: ReturnType<typeof cron.schedule> | null = null;
+let whishReconciliationTask: ReturnType<typeof cron.schedule> | null = null;
 
 // RADIUS server setup
 const radiusServer = dgram.createSocket('udp4');
@@ -395,6 +399,22 @@ initializeDB().then(async () => {
       }
     }
 
+    const whishReconciliationCron = String(process.env.WHISH_RECONCILIATION_CRON ?? "*/15 * * * *").trim();
+    if (whishReconciliationCron && whishReconciliationCron !== "off" && whishReconciliationCron !== "0") {
+      try {
+        whishReconciliationTask = cron.schedule(whishReconciliationCron, async () => {
+          try {
+            await runWhishClaimReconciliationJob();
+          } catch (e) {
+            console.error("[whish] reconciliation failed", e);
+          }
+        });
+        console.log(`[whish] reconciliation job enabled: ${whishReconciliationCron}`);
+      } catch (e) {
+        console.error("[whish] invalid WHISH_RECONCILIATION_CRON", e);
+      }
+    }
+
     const runOnStart = String(process.env.EXPIRY_DISCONNECT_RUN_ON_STARTUP ?? "").trim().toLowerCase();
     if (runOnStart === "1" || runOnStart === "true") {
       setTimeout(() => {
@@ -429,6 +449,9 @@ async function shutdown(signal: string) {
     } catch {}
     try {
       alertEvalTask?.stop();
+    } catch {}
+    try {
+      whishReconciliationTask?.stop();
     } catch {}
 
     // Stop accepting new HTTP connections
