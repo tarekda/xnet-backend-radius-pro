@@ -56,6 +56,13 @@ import {
   getProviderMacList,
   syncProviderMacAddresses,
 } from "../services/providerMacService";
+import { UserController } from "./userController";
+import { radiusAuthCacheService } from "../services/radiusAuthCacheService";
+import {
+  preserveUserDefaultProfile,
+  restoreSubscriberLine,
+  getSubscriberDunningEnforcementState,
+} from "../services/subscriberReactivationService";
 
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
   res.status(status).json({ success, message, data });
@@ -261,12 +268,29 @@ const applyDunningAction = async (params: {
       if (!Number.isFinite(profileId) || profileId <= 0) {
         return { ok: true, status: "skipped", reason: "Throttle profile not configured" };
       }
+      const currentUserProfile = await userRepo.findOne({ where: { username: params.invoice.username } });
+      if (currentUserProfile?.profileId && currentUserProfile.profileId !== profileId) {
+        await preserveUserDefaultProfile(params.invoice.username, currentUserProfile.profileId);
+      }
       await userRepo
         .createQueryBuilder()
         .update(Raduserprofile)
         .set({ profileId } as any)
         .where("username = :username", { username: params.invoice.username })
         .execute();
+
+      try {
+        await radiusAuthCacheService.invalidateUserCache(params.invoice.username);
+      } catch {}
+
+      const networkEnforceEnabled = String(process.env.DUNNING_NETWORK_ENFORCEMENT_ENABLED ?? "true").toLowerCase() !== "false";
+      if (networkEnforceEnabled) {
+        try {
+          await UserController.disconnectUser(params.invoice.username);
+        } catch (dcErr) {
+          console.warn(`[dunning] Disconnect on throttle for ${params.invoice.username} failed (non-fatal):`, dcErr);
+        }
+      }
     } else if (params.stage.action === "suspend") {
       await userRepo
         .createQueryBuilder()
@@ -274,6 +298,19 @@ const applyDunningAction = async (params: {
         .set({ accountStatus: "suspended" } as any)
         .where("username = :username", { username: params.invoice.username })
         .execute();
+
+      try {
+        await radiusAuthCacheService.invalidateUserCache(params.invoice.username);
+      } catch {}
+
+      const networkEnforceEnabled = String(process.env.DUNNING_NETWORK_ENFORCEMENT_ENABLED ?? "true").toLowerCase() !== "false";
+      if (networkEnforceEnabled) {
+        try {
+          await UserController.disconnectUser(params.invoice.username);
+        } catch (dcErr) {
+          console.warn(`[dunning] Disconnect on suspend for ${params.invoice.username} failed (non-fatal):`, dcErr);
+        }
+      }
     }
 
     await repo.update(
@@ -1698,5 +1735,44 @@ export const getWhatsAppDiagnosticsHandler = async (_req: Request, res: Response
   } catch (error: any) {
     console.error("Error fetching WhatsApp diagnostics:", error);
     return sendResponse(res, false, 500, error?.message || "Failed to fetch WhatsApp diagnostics");
+  }
+};
+
+/** Get subscriber live dunning enforcement state (throttled vs normal vs suspended). */
+export const getSubscriberDunningEnforcementHandler = async (req: Request, res: Response) => {
+  try {
+    const username = String(req.params.username || "").trim();
+    if (!username) {
+      return sendResponse(res, false, 400, "Username is required");
+    }
+    const state = await getSubscriberDunningEnforcementState(username);
+    if (!state) {
+      return sendResponse(res, false, 404, "Subscriber not found");
+    }
+    return sendResponse(res, true, 200, "Subscriber dunning enforcement state", state);
+  } catch (err: any) {
+    console.error("Error fetching subscriber dunning state:", err);
+    return sendResponse(res, false, 500, err?.message || "Failed to fetch subscriber dunning state");
+  }
+};
+
+/** Manual staff override to restore/unthrottle a subscriber line. */
+export const restoreSubscriberLineHandler = async (req: Request, res: Response) => {
+  try {
+    const username = String(req.params.username || "").trim();
+    if (!username) {
+      return sendResponse(res, false, 400, "Username is required");
+    }
+    const actor = (req as any).user?.username || "admin";
+    const force = Boolean(req.body?.force);
+    const result = await restoreSubscriberLine(username, {
+      actor,
+      trigger: "manual_override",
+      force,
+    });
+    return sendResponse(res, result.ok, result.ok ? 200 : 400, result.reason || "Subscriber line restored", result);
+  } catch (err: any) {
+    console.error("Error restoring subscriber line:", err);
+    return sendResponse(res, false, 500, err?.message || "Failed to restore subscriber line");
   }
 };

@@ -6,6 +6,7 @@ import {
   authDistributionHandler,
   geographicHandler,
   peakHoursHandler,
+  revenueInsightsHandler,
 } from "../controllers/analyticsController";
 import { clickhouseRollupService } from "../services/clickhouseRollupService";
 import { anomalyDetectionService } from "../services/anomalyDetectionService";
@@ -20,6 +21,7 @@ router.get("/metrics", metricsHandler);
 router.get("/auth-distribution", authDistributionHandler);
 router.get("/geographic", geographicHandler);
 router.get("/peak-hours", peakHoursHandler);
+router.get("/revenue", revenueInsightsHandler);
 
 /**
  * ClickHouse Daily Bandwidth Usage query per subscriber

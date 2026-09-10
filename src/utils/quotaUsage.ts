@@ -4,6 +4,7 @@ import { sqlMonthlyCycleResetAt, sqlMonthlyCycleStart } from "./quotaCycle";
 export type UserQuotaUsage = {
     dailyUsage: bigint;
     monthlyUsage: bigint;
+    activeTopupBytes: bigint;
     monthlyCycleStart: string | null;
     monthlyCycleResetAt: string | null;
     quotaResetDay: number | null;
@@ -35,12 +36,34 @@ export async function getQuotaUsageForUsers(usernames: string[]): Promise<Record
     `;
 
     const rows = await AppDataSource.query(sql, usernames);
+
+    let topupMap: Record<string, bigint> = {};
+    try {
+        const currentMonth = new Date().toISOString().slice(0, 7);
+        const topupRows = await AppDataSource.query(
+            `SELECT username, COALESCE(SUM(extra_bytes), 0) AS total_extra
+             FROM subscriber_topups
+             WHERE username IN (${placeholders})
+               AND status = 'active'
+               AND billing_month = ?
+               AND (expires_at IS NULL OR expires_at > NOW())
+             GROUP BY username`,
+            [...usernames, currentMonth]
+        );
+        for (const tr of topupRows) {
+            topupMap[String(tr.username)] = BigInt(tr.total_extra || "0");
+        }
+    } catch {
+        // Table may not exist in scratch tests
+    }
+
     return (rows as any[]).reduce((acc, r) => {
         const u = String(r?.username ?? "");
         if (!u) return acc;
         acc[u] = {
             dailyUsage: BigInt(String(r?.daily_usage ?? "0")),
             monthlyUsage: BigInt(String(r?.monthly_usage ?? "0")),
+            activeTopupBytes: topupMap[u] ?? BigInt(0),
             monthlyCycleStart: r?.monthly_cycle_start ? String(r.monthly_cycle_start) : null,
             monthlyCycleResetAt: r?.monthly_cycle_reset_at ? String(r.monthly_cycle_reset_at) : null,
             quotaResetDay: r?.quota_reset_day == null ? null : Number(r.quota_reset_day),
@@ -79,17 +102,21 @@ export async function enrichOnlineUserRowsWithQuotaAsync(rows: any[]): Promise<a
         const username = String(row?.session_username ?? "");
         const usage = usageMap[username];
         const monthlyUsage = usage?.monthlyUsage ?? BigInt(String(row?.monthly_usage ?? "0"));
-        const monthlyQuota = BigInt(String(row?.profile_monthly_quota ?? "0"));
+        const baseMonthlyQuota = BigInt(String(row?.profile_monthly_quota ?? "0"));
+        const activeTopup = usage?.activeTopupBytes ?? BigInt(0);
+        const effectiveMonthlyQuota = baseMonthlyQuota + activeTopup;
 
         return {
             ...row,
             monthly_usage: monthlyUsage.toString(),
+            active_topup_bytes: activeTopup.toString(),
+            effective_monthly_quota: effectiveMonthlyQuota.toString(),
             monthly_cycle_start: usage?.monthlyCycleStart ?? row?.monthly_cycle_start ?? null,
             monthly_cycle_reset_at: usage?.monthlyCycleResetAt ?? row?.monthly_cycle_reset_at ?? null,
             quota_reset_day: usage?.quotaResetDay ?? row?.quota_reset_day ?? null,
             quota_cycle_start_date: usage?.quotaCycleStartDate ?? row?.quota_cycle_start_date ?? null,
             is_monthly_exceeded: usage?.isMonthlyExceeded ? 1 : Number(row?.is_monthly_exceeded ?? 0),
-            monthly_usage_pct: monthlyUsagePct(monthlyUsage, monthlyQuota),
+            monthly_usage_pct: monthlyUsagePct(monthlyUsage, effectiveMonthlyQuota),
         };
     });
 }

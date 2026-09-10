@@ -28,7 +28,7 @@ jest.mock("../../db/config", () => ({
       rollbackTransaction: jest.fn(async () => {}),
       release: jest.fn(async () => {}),
       manager: {
-        getRepository: jest.fn((entity) => ({
+        getRepository: jest.fn(() => ({
           findOne: jest.fn(async ({ where }) => {
             if (where.gatewayIntentId) return mockIntent;
             if (where.username) return mockProfile;
@@ -36,8 +36,12 @@ jest.mock("../../db/config", () => ({
           }),
           create: jest.fn((obj) => obj),
           save: jest.fn(async (obj) => {
-            if (obj.gatewayIntentId) mockIntent = obj;
-            if (obj.username) mockProfile = obj;
+            // Raduserprofile has accountStatus; PaymentIntent has gatewayIntentId
+            if ("accountStatus" in obj) {
+              Object.assign(mockProfile, obj);
+            } else if (obj.gatewayIntentId) {
+              mockIntent = obj;
+            }
             return obj;
           }),
         })),
@@ -96,5 +100,56 @@ describe("PaymentReconciliationService", () => {
     expect(result.success).toBe(true);
     expect(result.reactivated).toBe(false);
     expect(result.message).toContain("already processed");
+  });
+
+  it("should extend expiry by exactly 1 calendar month, not 30 days", async () => {
+    const baseExpiry = new Date("2026-03-15T00:00:00.000Z");
+    mockProfile = {
+      username: "subscriber_paid",
+      accountStatus: "suspended",
+      isMonthlyExceeded: false,
+      expiresAt: baseExpiry,
+    };
+
+    const payload: PaymentWebhookPayload = {
+      transactionReference: "TXN-MONTH-TEST",
+      username: "subscriber_paid",
+      amountPaid: 25.0,
+      currency: "USD",
+      status: "SUCCESS",
+    };
+
+    await paymentReconciliationService.processPaymentWebhook(payload);
+
+    const newExpiry = new Date(mockProfile.expiresAt);
+    // Exactly 1 calendar month later (Apr 15), NOT 30 days later (Apr 14)
+    expect(newExpiry.getMonth()).toBe(3); // April = 3 (0-indexed)
+    expect(newExpiry.getDate()).toBe(15);
+    expect(newExpiry.getFullYear()).toBe(2026);
+  });
+
+  it("should handle month-edge (Jan 31 + 1 month = Feb 28, not Mar 3)", async () => {
+    const baseExpiry = new Date("2026-01-31T00:00:00.000Z");
+    mockProfile = {
+      username: "subscriber_paid",
+      accountStatus: "expired",
+      isMonthlyExceeded: false,
+      expiresAt: baseExpiry,
+    };
+
+    const payload: PaymentWebhookPayload = {
+      transactionReference: "TXN-EDGE-JAN31",
+      username: "subscriber_paid",
+      amountPaid: 25.0,
+      currency: "USD",
+      status: "SUCCESS",
+    };
+
+    await paymentReconciliationService.processPaymentWebhook(payload);
+
+    const newExpiry = new Date(mockProfile.expiresAt);
+    // Feb 2026 has 28 days; must NOT overshoot into March
+    expect(newExpiry.getMonth()).toBe(1); // February = 1
+    expect(newExpiry.getDate()).toBe(28);
   });
 });

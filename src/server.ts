@@ -1,6 +1,8 @@
 import 'reflect-metadata';
 
 import express from 'express';
+import compression from 'compression';
+import path from 'path';
 import axios from 'axios';
 import { randomUUID } from 'crypto';
 import radius from 'radius';
@@ -46,6 +48,7 @@ import aiRoutes from './routes/aiRoutes';
 import voucherRoutes from './routes/voucherRoutes';
 import externalUsersRoutes from './routes/externalUsersRoutes';
 import whatsappWebhookRoutes, { whatsappTwilioWebhookRouter } from './routes/whatsappWebhookRoutes';
+import topupRoutes from './routes/topupRoutes';
 import { setWsBroadcast } from './realtime/wsHub';
 import './events/invoiceListeners'
 import cors from 'cors';
@@ -57,6 +60,17 @@ import { startBackupScheduler } from "./backups/scheduler";
 import { runExpirySessionDisconnectJob } from "./jobs/expirySessionDisconnectJob";
 import { startConnectionLogsMaintenanceScheduler } from "./jobs/connectionLogsMaintenance";
 import { runWhishClaimReconciliationJob } from "./jobs/whishClaimReconciliationJob";
+import { startDailyRevenueSnapshotScheduler } from "./jobs/dailyRevenueSnapshotJob";
+import { startMonthlyQuotaResetScheduler } from "./jobs/monthlyQuotaResetJob";
+import { startAlertEscalationScheduler, stopAlertEscalationScheduler } from "./jobs/alertEscalationJob";
+import { startDunningEscalationScheduler, stopDunningEscalationScheduler } from "./jobs/dunningEscalationJob";
+import revenueLeakageRoutes from "./routes/revenueLeakageRoutes";
+import { startRevenueLeakageAuditScheduler, stopRevenueLeakageAuditScheduler } from "./jobs/revenueLeakageAuditJob";
+import { ipWhitelistMiddleware } from "./middleware/ipWhitelist";
+import { csrfProtectionMiddleware } from "./middleware/csrfProtection";
+import { requestIdMiddleware } from "./middleware/requestId";
+import { voucherService } from "./services/voucherService";
+import { clickhouseRollupService } from "./services/clickhouseRollupService";
 import { assertProductionSecrets, getJwtSecret, getRadiusSecret } from "./config/requireSecrets";
 import jwt from "jsonwebtoken";
 
@@ -83,12 +97,20 @@ app.use(express.json());
 // Enable CORS
 app.use(cors());
 
-// Request correlation id (useful for Loki/metrics correlation)
+// Enable HTTP response compression for JSON and responses > 1KB
+app.use(compression({ threshold: 1024 }));
+
+// Serve uploaded receipts and documents statically
+app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
+
+// Enterprise Security Hardening
+app.use(ipWhitelistMiddleware());
+app.use(csrfProtectionMiddleware());
+
+// Request correlation id (useful for Loki/metrics correlation and standardized envelopes)
+app.use(requestIdMiddleware);
 app.use((req, res, next) => {
-  const incoming = req.header("x-request-id");
-  const requestId = incoming && incoming.trim().length ? incoming : randomUUID();
-  (req as any).requestId = requestId;
-  res.setHeader("X-Request-Id", requestId);
+  (req as any).requestId = req.id;
   next();
 });
 
@@ -224,6 +246,7 @@ app.use("/api/analytics", analyticsRoutes);
 app.use("/api/auth/subscriber", subscriberAuthRoutes);
 app.use("/api/subscriber", subscriberApiRoutes);
 app.use("/api/invoices", paymentGatewayRoutes);
+app.use("/api/topups", topupRoutes);
 app.use("/api/webhooks/payments", paymentWebhookRoutes);
 
 app.use("/api/expenses", expenseRoutes);
@@ -241,6 +264,7 @@ app.use("/api/external-users", externalUsersRoutes);
 
 app.use("/api/cable-vision", cableVisionRoutes);
 app.use('/api', aiRoutes);
+app.use('/api/revenue-leakage', revenueLeakageRoutes);
 
 const monthlyInvoiceTask = cron.schedule("0 0 1 * *", async () => {
     console.log("Running monthly invoice generation...");
@@ -370,6 +394,19 @@ initializeDB().then(async () => {
     // Start scheduled backup jobs (if env cron vars are set)
     startBackupScheduler(app);
     startConnectionLogsMaintenanceScheduler();
+    startDailyRevenueSnapshotScheduler();
+    startMonthlyQuotaResetScheduler();
+    startAlertEscalationScheduler();
+    voucherService.init().catch((e) => console.warn("[vouchers] cache init failed (non-fatal):", e));
+
+    // Ensure ClickHouse flow-log schema (rollup table + materialized view) exists.
+    // Runs async so it never blocks server startup; safe to retry — uses IF NOT EXISTS.
+    setTimeout(() => {
+      clickhouseRollupService.ensureSchema().then((ok) => {
+        if (ok) console.log("[clickhouse] schema ensured");
+        else    console.warn("[clickhouse] ensureSchema returned false — ClickHouse may be unavailable");
+      }).catch((e) => console.warn("[clickhouse] ensureSchema failed (non-fatal):", e));
+    }, 8_000);
 
     const expiryDisconnectCronExpr = String(process.env.EXPIRY_DISCONNECT_CRON ?? "").trim();
     if (expiryDisconnectCronExpr) {
@@ -423,6 +460,8 @@ initializeDB().then(async () => {
     }
 
     await validateWhatsAppAtStartup();
+    startDunningEscalationScheduler();
+    startRevenueLeakageAuditScheduler();
 
     server.listen(process.env.PORT || 3000, () => {
         console.log(`Server is running on http://localhost:${process.env.PORT || 3000}`);
@@ -445,6 +484,12 @@ async function shutdown(signal: string) {
       dunningTask?.stop();
     } catch {}
     try {
+      stopDunningEscalationScheduler();
+    } catch {}
+    try {
+      stopRevenueLeakageAuditScheduler();
+    } catch {}
+    try {
       expiryDisconnectTask?.stop();
     } catch {}
     try {
@@ -452,6 +497,9 @@ async function shutdown(signal: string) {
     } catch {}
     try {
       whishReconciliationTask?.stop();
+    } catch {}
+    try {
+      stopAlertEscalationScheduler();
     } catch {}
 
     // Stop accepting new HTTP connections

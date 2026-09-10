@@ -1,20 +1,27 @@
 import { radiusAccountingQueueService, AccountingUpdatePayload } from "../radiusAccountingQueueService";
 import { redisClient } from "../../redisClient";
 
-jest.mock("../../redisClient", () => {
-  const queue: string[] = [];
-  return {
-    redisClient: {
-      isOpen: true,
-      rPush: jest.fn(async (_key: string, val: string) => {
-        queue.push(val);
-        return queue.length;
-      }),
-      lLen: jest.fn(async (_key: string) => queue.length),
-      lPop: jest.fn(async (_key: string) => queue.shift() || null),
-    },
-  };
-});
+const queues: Record<string, string[]> = {
+  "radius:accounting:queue": [],
+  "radius:accounting:dlq": [],
+};
+
+jest.mock("../../redisClient", () => ({
+  redisClient: {
+    isOpen: true,
+    rPush: jest.fn(async (key: string, val: string) => {
+      if (!queues[key]) queues[key] = [];
+      queues[key].push(val);
+      return queues[key].length;
+    }),
+    lLen: jest.fn(async (key: string) => (queues[key] ?? []).length),
+    lPop: jest.fn(async (key: string) => {
+      const q = queues[key];
+      return q && q.length ? q.shift()! : null;
+    }),
+    lTrim: jest.fn(async () => {}),
+  },
+}));
 
 jest.mock("../../db/config", () => ({
   AppDataSource: {
@@ -30,6 +37,9 @@ jest.mock("../../db/config", () => ({
 describe("RadiusAccountingQueueService", () => {
   beforeEach(() => {
     radiusAccountingQueueService.stopAutoFlush();
+    // Reset all queues before each test
+    Object.keys(queues).forEach((k) => (queues[k] = []));
+    jest.clearAllMocks();
   });
 
   it("should enqueue accounting updates into Redis list", async () => {
@@ -43,7 +53,10 @@ describe("RadiusAccountingQueueService", () => {
     };
 
     await radiusAccountingQueueService.enqueue(payload);
-    expect(redisClient.rPush).toHaveBeenCalled();
+    expect(redisClient.rPush).toHaveBeenCalledWith(
+      "radius:accounting:queue",
+      expect.any(String)
+    );
   });
 
   it("should flush queued items and process batch", async () => {
@@ -62,5 +75,31 @@ describe("RadiusAccountingQueueService", () => {
     await radiusAccountingQueueService.enqueue(payload);
     const flushedCount = await radiusAccountingQueueService.flushQueue();
     expect(flushedCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it("should route corrupt JSON payloads to the dead-letter queue", async () => {
+    // Manually push a corrupt string into the main queue
+    queues["radius:accounting:queue"].push("{ not valid json !!!");
+
+    await radiusAccountingQueueService.flushQueue();
+
+    // DLQ should have received the bad item
+    expect(redisClient.rPush).toHaveBeenCalledWith(
+      "radius:accounting:dlq",
+      expect.stringContaining("movedAt")
+    );
+    // Main queue should be empty
+    expect(queues["radius:accounting:queue"].length).toBe(0);
+  });
+
+  it("should return queue depths including dlq via getQueueDepths()", async () => {
+    // Seed a known state
+    queues["radius:accounting:queue"] = ["item1", "item2"];
+    queues["radius:accounting:dlq"] = ["dead1"];
+
+    const depths = await radiusAccountingQueueService.getQueueDepths();
+
+    expect(depths.queue).toBe(2);
+    expect(depths.dlq).toBe(1);
   });
 });

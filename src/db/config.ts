@@ -48,6 +48,9 @@ import { AlertIncident } from './entities/AlertIncident';
 import { AlertSettings } from './entities/AlertSettings';
 import { CompanyWalletEntry } from './entities/CompanyWalletEntry';
 import { InvoicePayment } from './entities/InvoicePayment';
+import { TopupPlan } from './entities/TopupPlan';
+import { SubscriberTopup } from './entities/SubscriberTopup';
+import { RevenueLeakageAudit } from './entities/RevenueLeakageAudit';
 
 // Create entities array with explicit references
 const entities = [
@@ -92,6 +95,9 @@ const entities = [
     AlertSettings,
     CompanyWalletEntry,
     InvoicePayment,
+    TopupPlan,
+    SubscriberTopup,
+    RevenueLeakageAudit,
 ];
 
 export const AppDataSource = new DataSource({
@@ -109,7 +115,14 @@ export const AppDataSource = new DataSource({
             ? "dist/db/migrations/**/*.js" 
             : "src/db/migrations/**/*.ts"
     ],
-    subscribers: [SessionTrackingSubscriber]
+    subscribers: [SessionTrackingSubscriber],
+    extra: {
+        connectionLimit: parseInt(process.env.DB_POOL_SIZE || "25", 10),
+        waitForConnections: true,
+        queueLimit: 0,
+        enableKeepAlive: true,
+        keepAliveInitialDelay: 10000,
+    }
 });
 
 async function ensureExternalInvoiceLastRemindedAtColumn(): Promise<void> {
@@ -214,6 +227,96 @@ async function ensureCompanyWalletAndInvoicePaymentTables(): Promise<void> {
     `);
 }
 
+async function ensureWhatsappInboundMessagesColumns(): Promise<void> {
+    const cols = [
+        { name: "intent", ddl: "VARCHAR(64) NULL DEFAULT NULL" },
+        { name: "reply_text", ddl: "TEXT NULL DEFAULT NULL" },
+        { name: "matched_username", ddl: "VARCHAR(64) NULL DEFAULT NULL" },
+    ];
+    for (const c of cols) {
+        const rows = (await AppDataSource.query(
+            `SELECT COUNT(*) AS cnt
+             FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE()
+               AND TABLE_NAME = 'whatsapp_inbound_messages'
+               AND COLUMN_NAME = '${c.name}'`
+        )) as Array<{ cnt: string | number }>;
+        if (Number(rows?.[0]?.cnt ?? 0) === 0) {
+            await AppDataSource.query(
+                `ALTER TABLE whatsapp_inbound_messages ADD COLUMN ${c.name} ${c.ddl}`
+            );
+            console.log(`✅ Added whatsapp_inbound_messages.${c.name}`);
+        }
+    }
+}
+
+async function ensureRevenueLeakageAuditsTable(): Promise<void> {
+    await AppDataSource.query(`
+      CREATE TABLE IF NOT EXISTS revenue_leakage_audits (
+        id INT NOT NULL AUTO_INCREMENT,
+        username VARCHAR(64) NOT NULL,
+        fullName VARCHAR(128) NULL,
+        nasIp VARCHAR(45) NULL,
+        nasIdentifier VARCHAR(64) NULL,
+        callerId VARCHAR(64) NULL,
+        framedIp VARCHAR(45) NULL,
+        leakType VARCHAR(64) NOT NULL,
+        leakReason TEXT NULL,
+        bytesIn BIGINT NOT NULL DEFAULT 0,
+        bytesOut BIGINT NOT NULL DEFAULT 0,
+        unpaidInvoiceId INT NULL,
+        unpaidAmount DECIMAL(10, 2) NOT NULL DEFAULT 0,
+        estimatedLossUsd DECIMAL(10, 2) NOT NULL DEFAULT 0,
+        remediationAction VARCHAR(64) NOT NULL DEFAULT 'none',
+        status VARCHAR(32) NOT NULL DEFAULT 'detected',
+        detectedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        resolvedAt DATETIME NULL,
+        resolvedBy VARCHAR(64) NULL,
+        metadata JSON NULL,
+        updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_rla_username (username),
+        KEY idx_rla_status (status),
+        KEY idx_rla_leak_type (leakType),
+        KEY idx_rla_detected_at (detectedAt)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+}
+
+async function ensurePerformanceIndexes(): Promise<void> {
+    const indexesToCheck = [
+        { table: 'external_invoices', name: 'idx_ext_inv_user', cols: '(username)' },
+        { table: 'external_invoices', name: 'idx_ext_inv_status', cols: '(status)' },
+        { table: 'external_invoices', name: 'idx_ext_inv_month', cols: '(billingMonth)' },
+        { table: 'external_invoices', name: 'idx_ext_inv_due', cols: '(payDueDate)' },
+        { table: 'external_invoices', name: 'idx_ext_inv_provider', cols: '(provider)' },
+        { table: 'external_invoices', name: 'idx_ext_inv_created', cols: '(createdAt)' },
+        { table: 'external_invoices', name: 'idx_ext_inv_user_status', cols: '(username, status)' },
+        { table: 'raduserprofile', name: 'idx_raduserprofile_user_status', cols: '(username, accountStatus)' },
+        { table: 'radacct', name: 'idx_radacct_active_user', cols: '(username, acctstoptime)' },
+    ];
+
+    for (const idx of indexesToCheck) {
+        try {
+            const rows = (await AppDataSource.query(
+                `SELECT COUNT(*) AS cnt
+                 FROM information_schema.STATISTICS
+                 WHERE TABLE_SCHEMA = DATABASE()
+                   AND TABLE_NAME = ?
+                   AND INDEX_NAME = ?`,
+                [idx.table, idx.name]
+            )) as Array<{ cnt: string | number }>;
+
+            if (Number(rows?.[0]?.cnt ?? 0) === 0) {
+                await AppDataSource.query(`ALTER TABLE \`${idx.table}\` ADD INDEX \`${idx.name}\` ${idx.cols}`);
+                console.log(`✅ Added performance index ${idx.name} on ${idx.table}${idx.cols}`);
+            }
+        } catch (err: any) {
+            console.warn(`⚠️ Performance index check skipped for ${idx.name} on ${idx.table}:`, err?.message || err);
+        }
+    }
+}
+
 export const initializeDB = async () => {
     try {
         // Debug: Log entities being loaded
@@ -253,6 +356,24 @@ export const initializeDB = async () => {
             await ensureCompanyWalletAndInvoicePaymentTables();
         } catch (patchError: any) {
             console.warn("⚠️ company wallet / invoice_payments schema patch skipped:", patchError?.message || patchError);
+        }
+
+        try {
+            await ensureWhatsappInboundMessagesColumns();
+        } catch (patchError: any) {
+            console.warn("⚠️ whatsapp_inbound_messages columns schema patch skipped:", patchError?.message || patchError);
+        }
+
+        try {
+            await ensureRevenueLeakageAuditsTable();
+        } catch (patchError: any) {
+            console.warn("⚠️ revenue_leakage_audits table schema patch skipped:", patchError?.message || patchError);
+        }
+
+        try {
+            await ensurePerformanceIndexes();
+        } catch (patchError: any) {
+            console.warn("⚠️ Performance indexes creation skipped:", patchError?.message || patchError);
         }
     } catch (error: any) {
         console.error("❌ Error connecting to database:", error);

@@ -1,6 +1,13 @@
-import { Column, Entity, OneToMany, PrimaryGeneratedColumn, DeleteDateColumn } from "typeorm";
+import { Column, Entity, Index, OneToMany, PrimaryGeneratedColumn, DeleteDateColumn } from "typeorm";
 import { ModificationLog } from "./ModificationLog";
 
+@Index("idx_ext_inv_user", ["username"])
+@Index("idx_ext_inv_status", ["status"])
+@Index("idx_ext_inv_month", ["billingMonth"])
+@Index("idx_ext_inv_due", ["payDueDate"])
+@Index("idx_ext_inv_provider", ["provider"])
+@Index("idx_ext_inv_created", ["createdAt"])
+@Index("idx_ext_inv_user_status", ["username", "status"])
 @Entity("external_invoices", { schema: "radius" })
 export class ExternalInvoice {
   @PrimaryGeneratedColumn({ type: "int", name: "id" })

@@ -5,6 +5,16 @@ import { radiusAuthCacheService } from "./radiusAuthCacheService";
 import { writeAuditLog } from "../audit/writeAuditLog";
 import { invoiceEvents } from "../events/invoiceEvents";
 
+/** Extend `from` by N whole calendar months (handles month-length edges, e.g. Jan 31 + 1 = Feb 28). */
+function addCalendarMonths(from: Date, months: number): Date {
+  const d = new Date(from.getTime());
+  const day = d.getDate();
+  d.setMonth(d.getMonth() + months);
+  // If setMonth overshot (e.g. Mar 31 → Apr 31 → May 1), roll back to last day of intended month
+  if (d.getDate() !== day) d.setDate(0);
+  return d;
+}
+
 export interface PaymentWebhookPayload {
   paymentIntentId?: string;
   transactionReference: string;
@@ -72,13 +82,12 @@ export class PaymentReconciliationService {
         profile.accountStatus = "active";
         profile.isMonthlyExceeded = false;
         profile.isFallback = false;
-        // Extend expiration by 30 days if expired or blank
+        // Extend expiration by 1 calendar month (consistent with renewSubscription in userController).
+        // Using calendar months handles edge cases like Jan 31 + 1 month = Feb 28, not Mar 3.
         const now = new Date();
         const currentExp = profile.expiresAt ? new Date(profile.expiresAt) : now;
         const baseDate = currentExp > now ? currentExp : now;
-        const newExp = new Date(baseDate);
-        newExp.setDate(newExp.getDate() + 30);
-        profile.expiresAt = newExp;
+        profile.expiresAt = addCalendarMonths(baseDate, 1);
 
         await userProfileRepo.save(profile);
         reactivated = true;

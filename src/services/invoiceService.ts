@@ -14,6 +14,7 @@ import { applyInvoicePayment } from '../billing/applyInvoicePayment';
 import { invoiceDue, remainingDue, resolvePaymentApply, roundMoney, withPaymentProgress } from '../billing/paymentMath';
 import { creditWallet, debitWallet, getWalletPaidTowardInvoice } from './subscriberWalletService';
 import { reverseCompanyInvoicePayment } from './companyWalletService';
+import { restoreSubscriberLine } from './subscriberReactivationService';
 
 /** Default VAT/tax rate for new invoices (e.g. 0.11 = 11%). 0 = tax inclusive amount only. */
 function defaultInvoiceTaxRate(): number {
@@ -456,7 +457,10 @@ export const payExternalInvoice = async (
         debitRemainder?: boolean;
     }
 ) => {
-    return AppDataSource.transaction(async (manager) => {
+    let paidUsername: string | null = null;
+    let targetInvoiceId: number | null = null;
+
+    const paymentResult = await AppDataSource.transaction(async (manager) => {
         const invoiceRepo = manager.getRepository(ExternalInvoice);
         const invoice = await invoiceRepo.findOne({
             where: { id: invoiceId },
@@ -469,6 +473,9 @@ export const payExternalInvoice = async (
             recordInvoicePayment("external_pay", "idempotent");
             return { ...withPaymentProgress(invoice), remainderInvoice: null as ExternalInvoice | null };
         }
+
+        paidUsername = invoice.username;
+        targetInvoiceId = invoice.id ?? null;
 
         const due = invoiceDue(invoice);
         const paidSoFar = roundMoney(Number(invoice.amountPaid ?? 0));
@@ -538,6 +545,24 @@ export const payExternalInvoice = async (
         recordInvoicePayment("external_pay", "ok");
         return { ...withPaymentProgress(invoice), remainderInvoice };
     });
+
+    // Trigger autonomous self-healing line restoration (runs outside the DB transaction)
+    if (paidUsername) {
+        try {
+            const autoRestoreEnabled = String(process.env.DUNNING_AUTO_RESTORE_ON_PAY_ENABLED ?? "true").toLowerCase() !== "false";
+            if (autoRestoreEnabled) {
+                await restoreSubscriberLine(paidUsername, {
+                    actor: actorUsername,
+                    invoiceId: targetInvoiceId ?? invoiceId,
+                    trigger: "external_invoice_paid",
+                });
+            }
+        } catch (healErr: any) {
+            console.warn(`[payExternalInvoice] Subscriber self-healing warning for ${paidUsername}:`, healErr?.message || healErr);
+        }
+    }
+
+    return paymentResult;
 };
 
 export const unpayExternalInvoice = async (invoiceId: number, actorUsername: string) => {

@@ -10,6 +10,8 @@ import {
   formatAlertMessage,
   type AlertMetricType,
 } from "./alertMetrics";
+import { alertNotificationService } from "../services/alertNotificationService";
+import { alertChannelService } from "./alertChannelService";
 
 const EVAL_MIN_INTERVAL_MS = 20_000;
 let lastEvalAt = 0;
@@ -110,7 +112,7 @@ async function evaluateOnce(): Promise<void> {
       if (open) continue;
 
       const now = new Date();
-      await incidentRepo.save(
+      const savedIncident = await incidentRepo.save(
         incidentRepo.create({
           ruleId: rule.id,
           ruleName: rule.name,
@@ -124,6 +126,11 @@ async function evaluateOnce(): Promise<void> {
           resolved: false,
         })
       );
+
+      // Asynchronously dispatch multi-channel notification
+      void alertChannelService.dispatchToAllChannels(savedIncident, "created").catch((e) => {
+        console.warn("[alerts] multi-channel dispatch failed:", e);
+      });
 
       rule.lastTriggered = now;
       rule.triggerCount = Number(rule.triggerCount || 0) + 1;
@@ -141,6 +148,9 @@ async function evaluateOnce(): Promise<void> {
 export async function evaluateAlertRules(): Promise<void> {
   lastEvalAt = Date.now();
   await evaluateOnce();
+  void alertChannelService.checkAndEscalateUnacknowledgedIncidents().catch((e) => {
+    console.warn("[alerts] incident escalation check failed:", e);
+  });
 }
 
 /** Used by GET /alerts so the UI sees fresh incidents without a dedicated worker. */

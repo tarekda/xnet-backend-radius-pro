@@ -1,11 +1,20 @@
 import { AppDataSource } from "../db/config";
 import { WhatsappInboundMessage } from "../db/entities/WhatsappInboundMessage";
+import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import { payExternalInvoiceFromWhatsAppGroupMessage } from "./whatsappPaymentGroupService";
+import { payExternalInvoicesFromWhatsAppInbound } from "./whatsappInboundPayService";
 
 export async function logInboundWhatsAppMessage(opts: {
   fromNumber: string;
   rawText: string;
   messageSid?: string | null;
+  mediaUrl?: string | null;
+  mediaType?: string | null;
+  ocrRawText?: string | null;
+  ocrExtractedData?: Record<string, any> | null;
+  intent?: string | null;
+  replyText?: string | null;
+  matchedUsername?: string | null;
 }): Promise<WhatsappInboundMessage | null> {
   try {
     const repo = AppDataSource.getRepository(WhatsappInboundMessage);
@@ -13,6 +22,13 @@ export async function logInboundWhatsAppMessage(opts: {
       fromNumber: opts.fromNumber,
       rawText: opts.rawText,
       messageSid: opts.messageSid ?? null,
+      mediaUrl: opts.mediaUrl ?? null,
+      mediaType: opts.mediaType ?? null,
+      ocrRawText: opts.ocrRawText ?? null,
+      ocrExtractedData: opts.ocrExtractedData ?? null,
+      intent: opts.intent ?? null,
+      replyText: opts.replyText ?? null,
+      matchedUsername: opts.matchedUsername ?? null,
       status: "received",
       createdAt: new Date(),
     });
@@ -36,6 +52,9 @@ export async function updateInboundWhatsAppMessageResult(
       paidInvoiceIds?: number[];
     }>;
     paidInvoiceIds?: number[];
+    intent?: string | null;
+    replyText?: string | null;
+    matchedUsername?: string | null;
   }
 ): Promise<void> {
   if (!id) return;
@@ -54,13 +73,23 @@ export async function updateInboundWhatsAppMessageResult(
   let errorDetail: string | null = null;
 
   if (resList.length > 0) {
-    const first = resList[0];
-    if (first.amount != null) extractedAmount = Number(first.amount);
-    if (first.status === "no_match") status = "no_match";
-    else if (first.status === "ambiguous") status = "ambiguous";
-    else if (first.status === "error") {
-      status = "error";
-      errorDetail = first.detail || "Error processing payment line";
+    const validAmounts = resList
+      .map((r) => r.amount)
+      .filter((a): a is number => a != null && Number.isFinite(a));
+    if (validAmounts.length > 0) {
+      extractedAmount = Number(validAmounts.reduce((sum, a) => sum + Number(a), 0).toFixed(2));
+    }
+
+    if (paidIds.length > 0) {
+      status = "processed";
+    } else {
+      const first = resList[0];
+      if (first.status === "no_match") status = "no_match";
+      else if (first.status === "ambiguous") status = "ambiguous";
+      else if (first.status === "error") {
+        status = "error";
+        errorDetail = first.detail || "Error processing payment line";
+      }
     }
   }
 
@@ -73,6 +102,9 @@ export async function updateInboundWhatsAppMessageResult(
   msg.paidInvoiceIds = paidIds;
   msg.status = status;
   msg.errorDetail = errorDetail;
+  if (result.intent !== undefined) msg.intent = result.intent;
+  if (result.replyText !== undefined) msg.replyText = result.replyText;
+  if (result.matchedUsername !== undefined) msg.matchedUsername = result.matchedUsername;
   msg.updatedAt = new Date();
 
   await repo.save(msg);
@@ -141,4 +173,40 @@ export async function retryInboundWhatsAppMessage(id: number) {
 
   await updateInboundWhatsAppMessageResult(msg.id, result);
   return result;
+}
+
+export async function resolveInboundWhatsAppMessage(
+  id: number,
+  invoiceId: number,
+  actor: string
+): Promise<{ ok: boolean; paidInvoiceIds: number[]; message: WhatsappInboundMessage }> {
+  return AppDataSource.transaction(async (manager) => {
+    const msgRepo = manager.getRepository(WhatsappInboundMessage);
+    const invRepo = manager.getRepository(ExternalInvoice);
+
+    const msg = await msgRepo.findOne({ where: { id } });
+    if (!msg) throw new Error("Inbound message not found");
+
+    const invoice = await invRepo.findOne({ where: { id: invoiceId } });
+    if (!invoice) throw new Error("Invoice not found");
+
+    if (String(invoice.status).toLowerCase() === "paid") {
+      throw new Error("Invoice is already paid");
+    }
+
+    const payerName = (Array.isArray(msg.parsedNames) && msg.parsedNames[0]) || invoice.fullName || "WhatsApp Collector";
+    const paidIds = await payExternalInvoicesFromWhatsAppInbound([invoice], payerName, {
+      from: msg.fromNumber,
+      messageId: msg.messageSid ?? undefined,
+      paidAmount: msg.extractedAmount ?? undefined,
+    });
+
+    msg.status = "processed";
+    msg.paidInvoiceIds = paidIds;
+    msg.errorDetail = `Manually resolved to invoice #${invoice.id} (${invoice.fullName}) by ${actor}`;
+    msg.updatedAt = new Date();
+    await msgRepo.save(msg);
+
+    return { ok: true, paidInvoiceIds: paidIds, message: msg };
+  });
 }

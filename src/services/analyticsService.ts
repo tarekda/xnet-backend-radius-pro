@@ -1,6 +1,8 @@
 import { AppDataSource } from "../db/config";
 import { ConnectionLogs } from "../db/entities/ConnectionLogs";
 import { Radacct } from "../db/entities/Radacct";
+import { ExternalInvoice } from "../db/entities/ExternalInvoice";
+import { Expense } from "../db/entities/Expense";
 import { sqlRadacctIsActive, sqlRadacctIsOnline, readOnlineSessionConfig } from "../utils/onlineSessionPolicy";
 
 export type AnalyticsRange = "1h" | "24h" | "7d" | "30d";
@@ -283,6 +285,175 @@ export async function getPeakHours() {
     hour: `${hour}:00`,
     usage: byHour.get(hour) || 0,
   }));
+}
+
+export interface MonthlyRevenueData {
+  month: string;
+  invoiced: number;
+  collected: number;
+  expenses: number;
+  netProfit: number;
+}
+
+export interface RevenueInsightsResponse {
+  summary: {
+    grossInvoiced: number;
+    collectedCash: number;
+    outstandingDue: number;
+    totalExpenses: number;
+    netMargin: number;
+    marginPct: number;
+    collectionRate: number;
+    activeSubscribers: number;
+    arpu: number;
+  };
+  monthlyTrends: MonthlyRevenueData[];
+  statusBreakdown: Array<{
+    status: string;
+    count: number;
+    totalAmount: number;
+    color: string;
+  }>;
+  topSpenders: Array<{
+    username: string;
+    fullName: string;
+    invoicesCount: number;
+    totalBilled: number;
+    totalPaid: number;
+  }>;
+}
+
+export async function getRevenueInsights(monthsCount = 6): Promise<RevenueInsightsResponse> {
+  const invRepo = AppDataSource.getRepository(ExternalInvoice);
+  const expRepo = AppDataSource.getRepository(Expense);
+
+  // 1. Overall totals
+  const invoiceTotals = await invRepo
+    .createQueryBuilder("inv")
+    .select("COALESCE(SUM(COALESCE(inv.totalAmount, inv.amount)), 0)", "gross")
+    .addSelect("COALESCE(SUM(inv.amountPaid), 0)", "paid")
+    .addSelect("COUNT(DISTINCT inv.username)", "uniqueUsers")
+    .where("inv.status != 'void' AND inv.voidedAt IS NULL")
+    .getRawOne<{ gross: string; paid: string; uniqueUsers: string }>();
+
+  const grossInvoiced = Math.round(Number(invoiceTotals?.gross ?? 0) * 100) / 100;
+  const collectedCash = Math.round(Number(invoiceTotals?.paid ?? 0) * 100) / 100;
+  const outstandingDue = Math.max(0, Math.round((grossInvoiced - collectedCash) * 100) / 100);
+  const activeSubscribers = Number(invoiceTotals?.uniqueUsers ?? 0);
+  const arpu = activeSubscribers > 0 ? Math.round((grossInvoiced / activeSubscribers) * 100) / 100 : 0;
+
+  // Total expenses
+  const expTotal = await expRepo
+    .createQueryBuilder("exp")
+    .select("COALESCE(SUM(exp.amount), 0)", "total")
+    .where("exp.deletedAt IS NULL")
+    .getRawOne<{ total: string }>();
+
+  const totalExpenses = Math.round(Number(expTotal?.total ?? 0) * 100) / 100;
+  const netMargin = Math.round((collectedCash - totalExpenses) * 100) / 100;
+  const marginPct = collectedCash > 0 ? Math.round((netMargin / collectedCash) * 1000) / 10 : 0;
+  const collectionRate = grossInvoiced > 0 ? Math.round((collectedCash / grossInvoiced) * 1000) / 10 : 0;
+
+  // 2. Monthly Trend (last N months)
+  const monthlyTrends: MonthlyRevenueData[] = [];
+  const now = new Date();
+
+  for (let i = monthsCount - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const startOfMonth = new Date(d.getFullYear(), d.getMonth(), 1);
+    const endOfMonth = new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999);
+    const monthLabel = d.toLocaleDateString("en-US", { month: "short", year: "numeric" });
+
+    const monthInv = await invRepo
+      .createQueryBuilder("inv")
+      .select("COALESCE(SUM(COALESCE(inv.totalAmount, inv.amount)), 0)", "invoiced")
+      .addSelect("COALESCE(SUM(inv.amountPaid), 0)", "collected")
+      .where("inv.createdAt >= :start AND inv.createdAt <= :end", { start: startOfMonth, end: endOfMonth })
+      .andWhere("inv.status != 'void' AND inv.voidedAt IS NULL")
+      .getRawOne<{ invoiced: string; collected: string }>();
+
+    const monthExp = await expRepo
+      .createQueryBuilder("exp")
+      .select("COALESCE(SUM(exp.amount), 0)", "expenses")
+      .where("exp.createdAt >= :start AND exp.createdAt <= :end", { start: startOfMonth, end: endOfMonth })
+      .andWhere("exp.deletedAt IS NULL")
+      .getRawOne<{ expenses: string }>();
+
+    const invVal = Math.round(Number(monthInv?.invoiced ?? 0) * 100) / 100;
+    const colVal = Math.round(Number(monthInv?.collected ?? 0) * 100) / 100;
+    const expVal = Math.round(Number(monthExp?.expenses ?? 0) * 100) / 100;
+
+    monthlyTrends.push({
+      month: monthLabel,
+      invoiced: invVal,
+      collected: colVal,
+      expenses: expVal,
+      netProfit: Math.round((colVal - expVal) * 100) / 100,
+    });
+  }
+
+  // 3. Status Breakdown
+  const statusRows = await invRepo
+    .createQueryBuilder("inv")
+    .select("inv.status", "status")
+    .addSelect("COUNT(*)", "cnt")
+    .addSelect("COALESCE(SUM(COALESCE(inv.totalAmount, inv.amount)), 0)", "total")
+    .where("inv.status != 'void' AND inv.voidedAt IS NULL")
+    .groupBy("inv.status")
+    .getRawMany<{ status: string; cnt: string; total: string }>();
+
+  const colorByStatus: Record<string, string> = {
+    paid: "#10b981",
+    partial: "#f59e0b",
+    unpaid: "#ef4444",
+    overdue: "#dc2626",
+  };
+
+  const statusBreakdown = statusRows.map((r) => ({
+    status: r.status,
+    count: Number(r.cnt ?? 0),
+    totalAmount: Math.round(Number(r.total ?? 0) * 100) / 100,
+    color: colorByStatus[r.status] || "#6b7280",
+  }));
+
+  // 4. Top Spenders
+  const topSpenderRows = await invRepo
+    .createQueryBuilder("inv")
+    .select("inv.username", "username")
+    .addSelect("MAX(inv.fullName)", "fullName")
+    .addSelect("COUNT(*)", "invoicesCount")
+    .addSelect("COALESCE(SUM(COALESCE(inv.totalAmount, inv.amount)), 0)", "totalBilled")
+    .addSelect("COALESCE(SUM(inv.amountPaid), 0)", "totalPaid")
+    .where("inv.status != 'void' AND inv.voidedAt IS NULL")
+    .groupBy("inv.username")
+    .orderBy("totalBilled", "DESC")
+    .limit(8)
+    .getRawMany<{ username: string; fullName: string; invoicesCount: string; totalBilled: string; totalPaid: string }>();
+
+  const topSpenders = topSpenderRows.map((r) => ({
+    username: r.username,
+    fullName: r.fullName || r.username,
+    invoicesCount: Number(r.invoicesCount ?? 0),
+    totalBilled: Math.round(Number(r.totalBilled ?? 0) * 100) / 100,
+    totalPaid: Math.round(Number(r.totalPaid ?? 0) * 100) / 100,
+  }));
+
+  return {
+    summary: {
+      grossInvoiced,
+      collectedCash,
+      outstandingDue,
+      totalExpenses,
+      netMargin,
+      marginPct,
+      collectionRate,
+      activeSubscribers,
+      arpu,
+    },
+    monthlyTrends,
+    statusBreakdown,
+    topSpenders,
+  };
 }
 
 export { parseRange };

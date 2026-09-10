@@ -2,7 +2,30 @@
 let RouterOSAPI: any = null;
 try {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  RouterOSAPI = require('node-routeros').RouterOSAPI;
+  const ros = require('node-routeros');
+  RouterOSAPI = ros.RouterOSAPI;
+  try {
+    const { Channel } = require('node-routeros/dist/Channel');
+    if (Channel && Channel.prototype) {
+      Channel.prototype.onUnknown = function (reply: string) {
+        if (reply === '!empty') {
+          if (!this.trapped) this.emit('done', this.data || []);
+          return;
+        }
+        if (!this.trapped) this.emit('done', this.data || []);
+      };
+    }
+    const { Receiver } = require('node-routeros/dist/connector/Receiver');
+    if (Receiver && Receiver.prototype) {
+      Receiver.prototype.sendTagData = function (currentTag: any) {
+        const tag = this.tags.get(currentTag);
+        if (tag) {
+          tag.callback(this.currentPacket);
+        }
+        this.cleanUp();
+      };
+    }
+  } catch {}
 } catch (err) {
   // Module not present – will run in mock mode
 }
@@ -342,11 +365,32 @@ export class BandwidthService {
   async getActiveConnections(): Promise<any> {
     if (this.mockMode) return this.generateMockActiveConnections();
 
-    await this.ensureConnection();
-    const pppActive = await this.conn.write('/ppp/active/print').catch(() => []);
-    const dhcpLeases = await this.conn.write('/ip/dhcp-server/lease/print', [
-      '?status=bound'
-    ]).catch(() => []);
+    try {
+      await this.ensureConnection();
+    } catch (e: any) {
+      logger.warn('getActiveConnections ensureConnection failed:', e?.message || e);
+      return { pppConnections: [], dhcpConnections: [], totalActiveConnections: 0 };
+    }
+
+    let pppActive: any[] = [];
+    let dhcpLeases: any[] = [];
+
+    try {
+      const res = await this.conn.write('/ppp/active/print');
+      pppActive = Array.isArray(res) ? res : [];
+    } catch (e: any) {
+      logger.warn('getActiveConnections /ppp/active/print warning:', e?.message || e);
+      pppActive = [];
+    }
+
+    try {
+      const res = await this.conn.write('/ip/dhcp-server/lease/print', ['?status=bound']);
+      dhcpLeases = Array.isArray(res) ? res : [];
+    } catch (e: any) {
+      logger.warn('getActiveConnections /ip/dhcp-server/lease/print warning:', e?.message || e);
+      dhcpLeases = [];
+    }
+
     return {
       pppConnections: pppActive,
       dhcpConnections: dhcpLeases,

@@ -21,6 +21,10 @@ import {
   subscriberVoucherPlans,
   subscriberBuyVoucher,
 } from "../controllers/subscriberController";
+import {
+  subscriberGetTopupPlansHandler,
+  subscriberBuyTopupHandler,
+} from "../controllers/topupController";
 
 const authRouter = Router();
 authRouter.post("/login", authLoginLimiter, subscriberLogin);
@@ -44,6 +48,8 @@ apiRouter.post("/invoices/:id/pay-from-wallet", subscriberPayFromWallet);
 apiRouter.post("/redeem-voucher", subscriberRedeemVoucher);
 apiRouter.get("/voucher-plans", subscriberVoucherPlans);
 apiRouter.post("/buy-voucher", subscriberBuyVoucher);
+apiRouter.get("/topup-plans", subscriberGetTopupPlansHandler);
+apiRouter.post("/buy-topup", subscriberBuyTopupHandler);
 
 export const subscriberAuthRoutes = authRouter;
 export const subscriberApiRoutes = apiRouter;

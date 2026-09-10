@@ -13,6 +13,7 @@ import {
   type AlertSettingsPayload,
 } from "../alerts/alertMetrics";
 import { evaluateAlertRulesIfStale } from "../alerts/evaluateAlertRules";
+import { alertNotificationService } from "../services/alertNotificationService";
 
 function serializeRule(rule: AlertRule) {
   return {
@@ -368,6 +369,11 @@ export const testAlert = async (req: Request, res: Response) => {
       })
     );
 
+    // Asynchronously dispatch test webhook if configured
+    void alertNotificationService.sendAlertWebhook(saved, "test").catch((e) => {
+      console.warn("[alerts] test webhook dispatch failed:", e);
+    });
+
     res.json({
       success: true,
       data: serializeIncident(saved),
@@ -376,5 +382,22 @@ export const testAlert = async (req: Request, res: Response) => {
   } catch (error) {
     console.error("Error creating test alert:", error);
     res.status(500).json({ success: false, message: "Failed to create test alert" });
+  }
+};
+
+export const testWebhookEndpoint = async (req: Request, res: Response) => {
+  try {
+    const url = String((req.body ?? {}).url ?? "").trim();
+    if (!url) {
+      return res.status(400).json({ success: false, message: "Webhook URL is required" });
+    }
+    const result = await alertNotificationService.testWebhook(url);
+    if (!result.success) {
+      return res.status(400).json({ success: false, message: result.error || "Failed to reach webhook endpoint" });
+    }
+    return res.json({ success: true, message: `Webhook test succeeded (HTTP ${result.status})` });
+  } catch (error: any) {
+    console.error("Error testing webhook:", error);
+    res.status(500).json({ success: false, message: error?.message || "Failed to test webhook" });
   }
 };

@@ -1,6 +1,6 @@
 {
   "name": "xnet-backend-radius-pro",
-  "version": "1.0.0",
+  "version": "1.5.4",
   "description": "",
   "main": "server.js",
   "scripts": {
@@ -48,6 +48,7 @@
     "amqplib": "^0.10.5",
     "axios": "^1.9.0",
     "bcryptjs": "^3.0.2",
+    "compression": "^1.8.1",
     "cors": "^2.8.5",
     "date-fns": "^4.1.0",
     "express": "^4.21.2",
@@ -69,6 +70,7 @@
     "socket.io": "^4.8.1",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
+    "tesseract.js": "^7.0.0",
     "twilio": "^5.10.0",
     "ws": "^8.18.1",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
@@ -76,6 +78,7 @@
   "devDependencies": {
     "@types/amqplib": "^0.10.7",
     "@types/bcryptjs": "^2.4.6",
+    "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/express-rate-limit": "^5.1.3",

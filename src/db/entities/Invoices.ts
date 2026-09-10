@@ -11,6 +11,8 @@ import { Raduserprofile } from "./Raduserprofile";
 
 @Index("idx_user_profile_id", ["userProfileId"], {})
 @Index("idx_user_details_id", ["userDetailsId"], {})
+@Index("idx_invoices_billing_month", ["billingMonth"], {})
+@Index("idx_invoices_status", ["status"], {})
 @Entity("invoices", { schema: "radius" })
 export class Invoices {
   @PrimaryGeneratedColumn({ type: "int", name: "id", unsigned: true })

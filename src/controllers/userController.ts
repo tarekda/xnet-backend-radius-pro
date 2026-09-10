@@ -183,7 +183,8 @@ async function getFreshUsersStatusMap(
 
     const sessionRepo = AppDataSource.getRepository(SessionTracking);
 
-    const rows = await sessionRepo
+    // 1) Find currently active online sessions for these usernames
+    const activeRows = await sessionRepo
         .createQueryBuilder("st")
         .select("st.username", "username")
         .addSelect("MAX(CASE WHEN ra.acctsessionid IS NOT NULL THEN 1 ELSE 0 END)", "isOnline")
@@ -202,15 +203,34 @@ async function getFreshUsersStatusMap(
         .groupBy("st.username")
         .getRawMany<{ username: string; isOnline: any; lastTimeActive: any }>();
 
-    return rows.reduce((acc, row) => {
-        const username = row?.username;
-        if (!username) return acc;
-        acc[username] = {
-            isOnline: row.isOnline === true || row.isOnline === 1 || row.isOnline === "1",
-            lastTimeActive: row.lastTimeActive ?? null,
-        };
-        return acc;
-    }, {} as Record<string, { isOnline: boolean; lastTimeActive: any }>);
+    // 2) Find historical last active timestamp for any user
+    const historyRows = await sessionRepo
+        .createQueryBuilder("st2")
+        .select("st2.username", "username")
+        .addSelect("MAX(COALESCE(st2.last_update, st2.end_time, st2.start_time))", "lastTimeActive")
+        .where("st2.username IN (:...usernames)", { usernames })
+        .groupBy("st2.username")
+        .getRawMany<{ username: string; lastTimeActive: any }>();
+
+    const statusMap: Record<string, { isOnline: boolean; lastTimeActive: any }> = {};
+    for (const u of usernames) {
+        statusMap[u] = { isOnline: false, lastTimeActive: null };
+    }
+    for (const h of historyRows) {
+        if (h?.username && statusMap[h.username]) {
+            statusMap[h.username].lastTimeActive = h.lastTimeActive ?? null;
+        }
+    }
+    for (const r of activeRows) {
+        if (r?.username && statusMap[r.username]) {
+            statusMap[r.username].isOnline = r.isOnline === true || r.isOnline === 1 || r.isOnline === "1";
+            if (r.lastTimeActive) {
+                statusMap[r.username].lastTimeActive = r.lastTimeActive;
+            }
+        }
+    }
+
+    return statusMap;
 }
 
 function formatMikrotikRateLimitKbps(speedDown: number | null | undefined, speedUp: number | null | undefined): string {
@@ -404,40 +424,6 @@ export const UserController = {
                     "userDetails",
                     "user.username = userDetails.username"
                 )
-                .leftJoin(
-                    (qb) =>
-                        qb
-                            .from(SessionTracking, "st")
-                            .select([
-                                "st.username AS st_username",
-                                // Online = there exists an active session with a matching open radacct row
-                                // that has been updated recently (acctupdatetime/starttime within staleCutoff).
-                                "MAX(CASE WHEN ra.acctsessionid IS NOT NULL THEN 1 ELSE 0 END) AS is_online",
-                                "MAX(COALESCE(ra.acctupdatetime, ra.acctstarttime, st.last_update, st.start_time)) AS last_online_ping",
-                            ])
-                            .where("st.status = 'active'")
-                            .leftJoin(
-                                "radacct",
-                                "ra",
-                                `ra.acctsessionid = st.session_id AND ${sqlRadacctIsOnline("ra")}`,
-                                { staleCutoff, activeCutoff }
-                            )
-                            .groupBy("st.username"),
-                    "activeSess",
-                    "user.username = activeSess.st_username"
-                )
-                .leftJoin(
-                    (qb) =>
-                        qb
-                            .from(SessionTracking, "st2")
-                            .select([
-                                "st2.username AS la_username",
-                                "MAX(COALESCE(st2.last_update, st2.end_time, st2.start_time)) AS last_time_active",
-                            ])
-                            .groupBy("st2.username"),
-                    "lastActive",
-                    "user.username = lastActive.la_username"
-                )
                 .select([
                     "user.id",
                     "user.username",
@@ -450,6 +436,7 @@ export const UserController = {
                     "user.accountStatus",
                     "user.expiresAt",
                     "user.expiryFramedIp",
+                    "user.ownerResellerId",
                     "profile.id",
                     "profile.profileName",
                     "profile.dailyQuota",
@@ -463,18 +450,9 @@ export const UserController = {
                     "userDetails.phoneNumber",
                     "userDetails.email",
                 ])
-                .addSelect(
-                    "CASE WHEN COALESCE(activeSess.is_online, 0) = 1 THEN true ELSE false END",
-                    "isOnline"
-                )
-                .addSelect(
-                    "COALESCE(activeSess.last_online_ping, lastActive.last_time_active)",
-                    "lastTimeActive"
-                )
                 .orderBy("user.id", "ASC")
                 .limit(limit)
-                .offset(offset)
-                .setParameters({ staleCutoff, activeCutoff })
+                .offset(offset);
             
             if (isReseller) {
                 qb.andWhere("user.ownerResellerId = :rid", { rid: resellerId });
@@ -485,16 +463,28 @@ export const UserController = {
                 });
             }
             if (onlineFilter !== null) {
-                qb.andWhere(
-                    onlineFilter
-                        ? "COALESCE(activeSess.is_online, 0) = 1"
-                        : "COALESCE(activeSess.is_online, 0) = 0"
-                );
+                const onlineExists = `EXISTS (
+                    SELECT 1
+                    FROM session_tracking stf
+                    INNER JOIN radacct raf
+                      ON raf.acctsessionid = stf.session_id
+                     AND ${sqlRadacctIsOnline("raf")}
+                    WHERE stf.username = user.username
+                      AND stf.status = 'active'
+                )`;
+                qb.andWhere(onlineFilter ? onlineExists : `NOT ${onlineExists}`);
+                qb.setParameters({ staleCutoff, activeCutoff });
             }
 
-            const { entities, raw } = await qb.getRawAndEntities();
+            const entities = await qb.getMany();
+            const pageUsernames = entities.map((u: any) => u?.username).filter(Boolean);
+            const freshStatus = await getFreshUsersStatusMap(pageUsernames, staleCutoff, activeCutoff);
 
-            const users = formatUsersWithStatus(entities, raw);
+            const users = entities.map((user: any) => ({
+                ...user,
+                isOnline: !!freshStatus[user.username]?.isOnline,
+                lastTimeActive: freshStatus[user.username]?.lastTimeActive ?? null,
+            }));
             const usersWithQuota = await withQuotaExceededFlags(users);
 
             // Create a status map for caching
@@ -1403,38 +1393,6 @@ export const UserController = {
                     "userDetails",
                     "user.username = userDetails.username"
                 )
-                .leftJoin(
-                    (qb) =>
-                        qb
-                            .from(SessionTracking, "st")
-                            .select([
-                                "st.username AS st_username",
-                                "MAX(CASE WHEN ra.acctsessionid IS NOT NULL THEN 1 ELSE 0 END) AS is_online",
-                                "MAX(COALESCE(ra.acctupdatetime, ra.acctstarttime, st.last_update, st.start_time)) AS last_online_ping",
-                            ])
-                            .where("st.status = 'active'")
-                            .leftJoin(
-                                "radacct",
-                                "ra",
-                                `ra.acctsessionid = st.session_id AND ${sqlRadacctIsOnline("ra")}`,
-                                { staleCutoff, activeCutoff }
-                            )
-                            .groupBy("st.username"),
-                    "activeSess",
-                    "user.username = activeSess.st_username"
-                )
-                .leftJoin(
-                    (qb) =>
-                        qb
-                            .from(SessionTracking, "st2")
-                            .select([
-                                "st2.username AS la_username",
-                                "MAX(COALESCE(st2.last_update, st2.end_time, st2.start_time)) AS last_time_active",
-                            ])
-                            .groupBy("st2.username"),
-                    "lastActive",
-                    "user.username = lastActive.la_username"
-                )
                 .select([
                     "user.id",
                     "user.username",
@@ -1461,14 +1419,6 @@ export const UserController = {
                     "userDetails.phoneNumber",
                     "userDetails.email",
                 ])
-                .addSelect(
-                    "CASE WHEN COALESCE(activeSess.is_online, 0) = 1 THEN true ELSE false END",
-                    "isOnline"
-                )
-                .addSelect(
-                    "COALESCE(activeSess.last_online_ping, lastActive.last_time_active)",
-                    "lastTimeActive"
-                )
                 .where(
                     new Brackets((searchQb) => {
                         searchQb
@@ -1476,7 +1426,7 @@ export const UserController = {
                             .orWhere("userDetails.email LIKE :query", { query: `%${query}%` })
                             .orWhere("userDetails.fullName LIKE :query", { query: `%${query}%` });
                     })
-                )
+                );
             
             // Apply reseller scoping (this will become (A OR B OR C) AND owner_reseller_id = rid)
             if (isReseller) qb.andWhere("user.ownerResellerId = :rid", { rid: resellerId });
@@ -1486,19 +1436,32 @@ export const UserController = {
                 });
             }
             if (onlineFilter !== null) {
-                qb.andWhere(
-                    onlineFilter
-                        ? "COALESCE(activeSess.is_online, 0) = 1"
-                        : "COALESCE(activeSess.is_online, 0) = 0"
-                );
+                const onlineExists = `EXISTS (
+                    SELECT 1
+                    FROM session_tracking stf
+                    INNER JOIN radacct raf
+                      ON raf.acctsessionid = stf.session_id
+                     AND ${sqlRadacctIsOnline("raf")}
+                    WHERE stf.username = user.username
+                      AND stf.status = 'active'
+                )`;
+                qb.andWhere(onlineFilter ? onlineExists : `NOT ${onlineExists}`);
+                qb.setParameters({ staleCutoff, activeCutoff });
             }
 
-            const { entities, raw } = await qb
+            const entities = await qb
                 .orderBy("user.id", "ASC")
-                .setParameters({ staleCutoff, activeCutoff })
-                .getRawAndEntities();
+                .limit(100)
+                .getMany();
 
-            const users = formatUsersWithStatus(entities, raw);
+            const searchUsernames = entities.map((u: any) => u?.username).filter(Boolean);
+            const freshStatus = await getFreshUsersStatusMap(searchUsernames, staleCutoff, activeCutoff);
+
+            const users = entities.map((user: any) => ({
+                ...user,
+                isOnline: !!freshStatus[user.username]?.isOnline,
+                lastTimeActive: freshStatus[user.username]?.lastTimeActive ?? null,
+            }));
             const usersWithQuota = await withQuotaExceededFlags(users);
 
             const responseData = {
@@ -1524,6 +1487,15 @@ export const UserController = {
     getUsersMetrics: async (req: Request, res: Response) => {
         try {
             const { isReseller, resellerId } = getResellerFilter(req);
+            const scope = isReseller ? `reseller_${resellerId}` : "global";
+            const cacheKey = `users_metrics_${scope}`;
+            try {
+                const cached = await redisClient.get(cacheKey);
+                if (cached) {
+                    return sendResponse(res, true, 200, "User metrics fetched successfully", JSON.parse(cached));
+                }
+            } catch {}
+
             const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
             const userRepo = AppDataSource.getRepository(Raduserprofile);
 
@@ -1590,7 +1562,7 @@ export const UserController = {
                 )) as Array<{ week: string; cnt: string }>;
             } catch {}
 
-            return sendResponse(res, true, 200, "User metrics fetched successfully", {
+            const responseData = {
                 total,
                 online,
                 monthlyExceeded,
@@ -1599,7 +1571,13 @@ export const UserController = {
                     onlineDaily: onlineDaily.map((r) => ({ day: String(r.day).slice(0, 10), count: Number(r.cnt || 0) })),
                     newUsersWeekly: newUsersWeekly.map((r) => ({ week: r.week, count: Number(r.cnt || 0) })),
                 },
-            });
+            };
+
+            try {
+                await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 20 });
+            } catch {}
+
+            return sendResponse(res, true, 200, "User metrics fetched successfully", responseData);
         } catch (error) {
             console.error("Error fetching user metrics:", error);
             return sendResponse(res, false, 500, "Error fetching user metrics");

@@ -118,7 +118,8 @@ export async function resolveWhatsappPaymentAmbiguity(
 
     const allowed = Array.isArray(row.candidateInvoiceIds) ? row.candidateInvoiceIds : [];
     if (!allowed.includes(invoiceId)) {
-      throw Object.assign(new Error("Invoice is not a candidate for this payment"), { status: 400 });
+      // Allow staff manual resolution override
+      row.candidateInvoiceIds = [...allowed, invoiceId];
     }
 
     const invoice = await invRepo.findOne({ where: { id: Equal(invoiceId) } });

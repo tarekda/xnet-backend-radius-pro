@@ -9,7 +9,8 @@ import {
   resolveAlert,
   getAlertSettings,
   updateAlertSettings,
-  testAlert
+  testAlert,
+  testWebhookEndpoint,
 } from '../controllers/alertController';
 import { authenticateToken, authorizePermissions } from '../middleware/authMiddleware';
 
@@ -40,5 +41,6 @@ router.put('/settings', asyncHandler(updateAlertSettings));
 
 // Test route (for development)
 router.post('/test', asyncHandler(testAlert));
+router.post('/test-webhook', asyncHandler(testWebhookEndpoint));
 
 export default router; 

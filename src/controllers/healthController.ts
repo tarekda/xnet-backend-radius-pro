@@ -3,10 +3,17 @@ import amqp from "amqplib";
 import { AppDataSource } from "../db/config";
 import { redisClient } from "../redisClient";
 import { isShuttingDown } from "../state/shutdown";
+import { radiusAccountingQueueService } from "../services/radiusAccountingQueueService";
+import { getVersionInfo } from "../utils/version";
 
 export const healthCheck = (_req: Request, res: Response) => {
-  res.status(200).json({ status: "UP" });
+  res.status(200).json({
+    status: "UP",
+    ...getVersionInfo(),
+    uptime: Math.floor(process.uptime()),
+  });
 };
+
 
 async function checkRabbitMq(): Promise<{ ok: boolean; reason?: string }> {
   const url = process.env.RABBITMQ_URL || "amqp://127.0.0.1:5672";
@@ -40,6 +47,7 @@ export const readyCheck = async (_req: Request, res: Response, _next: NextFuncti
     db: { ok: false },
     redis: { ok: false },
     rabbitmq: { ok: false, required: rabbitRequired },
+    radiusQueue: { ok: true, queue: 0, dlq: 0 },
   };
 
   checks.db.ok = AppDataSource.isInitialized === true;
@@ -49,6 +57,15 @@ export const readyCheck = async (_req: Request, res: Response, _next: NextFuncti
     if (isOpen) {
       await redisClient.ping();
       checks.redis.ok = true;
+
+      // Fetch queue depths (informational — never makes the endpoint return 503)
+      const depths = await radiusAccountingQueueService.getQueueDepths();
+      checks.radiusQueue = {
+        ok: depths.dlq === 0,
+        queue: depths.queue,
+        dlq: depths.dlq,
+        ...(depths.dlq > 0 ? { warning: `${depths.dlq} item(s) in dead-letter queue` } : {}),
+      };
     } else {
       checks.redis.ok = false;
       checks.redis.reason = "not_connected";
@@ -64,5 +81,19 @@ export const readyCheck = async (_req: Request, res: Response, _next: NextFuncti
     Boolean(checks.db.ok && checks.redis.ok) &&
     (rabbitRequired ? Boolean(checks.rabbitmq.ok) : true);
 
-  res.status(ok ? 200 : 503).json({ status: ok ? "UP" : "DOWN", checks });
+  res.status(ok ? 200 : 503).json({
+    status: ok ? "UP" : "DOWN",
+    ...getVersionInfo(),
+    uptime: Math.floor(process.uptime()),
+    checks,
+  });
+};
+
+export const circuitBreakersCheck = (_req: Request, res: Response): void => {
+  const { CircuitBreakerRegistry } = require("../utils/circuitBreaker");
+  res.status(200).json({
+    status: "OK",
+    timestamp: new Date().toISOString(),
+    circuitBreakers: CircuitBreakerRegistry.getAllMetrics(),
+  });
 };

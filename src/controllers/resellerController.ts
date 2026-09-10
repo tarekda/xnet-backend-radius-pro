@@ -431,3 +431,101 @@ export const resellerUsersCreate = [
   },
 ];
 
+export const resellerAdminGetCommission = [
+  authorizePermissions("admin.resellers.manage"),
+  async (req: Request, res: Response) => {
+    const resellerId = Number(req.params.id);
+    if (!Number.isFinite(resellerId)) return send(res, false, 400, "Invalid reseller id");
+
+    const ledgerRepo = AppDataSource.getRepository(ResellerLedgerEntry);
+    const entries = await ledgerRepo.find({
+      where: { resellerId } as any,
+      order: { createdAt: "DESC" },
+    });
+
+    const commissionCredits = entries
+      .filter((e) => e.entryType === "credit" && e.referenceType === "commission")
+      .reduce((sum, e) => sum + Number(e.amount || 0), 0);
+
+    const commissionPayouts = entries
+      .filter((e) => e.entryType === "debit" && e.referenceType === "commission_payout")
+      .reduce((sum, e) => sum + Number(e.amount || 0), 0);
+
+    const pendingBalance = Math.max(0, commissionCredits - commissionPayouts);
+
+    return send(res, true, 200, "Reseller commission details fetched", {
+      resellerId,
+      commissionRate: 10.0, // Default 10%
+      totalEarned: commissionCredits,
+      totalPaidOut: commissionPayouts,
+      pendingBalance,
+      history: entries.filter((e) => e.referenceType?.startsWith("commission")),
+    });
+  },
+];
+
+export const resellerAdminPayoutCommission = [
+  authorizePermissions("admin.resellers.manage"),
+  async (req: Request, res: Response) => {
+    const resellerId = Number(req.params.id);
+    const { amount, note } = req.body ?? {};
+    if (!Number.isFinite(resellerId)) return send(res, false, 400, "Invalid reseller id");
+
+    const payoutAmount = Number(amount);
+    if (!Number.isFinite(payoutAmount) || payoutAmount <= 0) {
+      return send(res, false, 400, "Valid positive payout amount is required");
+    }
+
+    const ledgerRepo = AppDataSource.getRepository(ResellerLedgerEntry);
+    const entry = ledgerRepo.create({
+      resellerId,
+      amount: payoutAmount.toFixed(2),
+      currency: "USD",
+      entryType: "debit",
+      referenceType: "commission_payout",
+      referenceId: `payout-${Date.now()}`,
+      note: note ? String(note).slice(0, 255) : "Commission payout settlement",
+      createdBy: (req.user as any)?.id ?? null,
+    });
+    await ledgerRepo.save(entry);
+
+    return send(res, true, 200, "Commission payout processed successfully", {
+      payoutId: entry.id,
+      amount: payoutAmount,
+      resellerId,
+    });
+  },
+];
+
+export const resellerGetMyCommission = [
+  async (req: Request, res: Response) => {
+    const resellerId = (req.user as any)?.resellerId;
+    if (!resellerId || !Number.isFinite(resellerId)) {
+      return send(res, false, 403, "Access restricted to authenticated resellers");
+    }
+
+    const ledgerRepo = AppDataSource.getRepository(ResellerLedgerEntry);
+    const entries = await ledgerRepo.find({
+      where: { resellerId } as any,
+      order: { createdAt: "DESC" },
+    });
+
+    const commissionCredits = entries
+      .filter((e) => e.entryType === "credit" && e.referenceType === "commission")
+      .reduce((sum, e) => sum + Number(e.amount || 0), 0);
+
+    const commissionPayouts = entries
+      .filter((e) => e.entryType === "debit" && e.referenceType === "commission_payout")
+      .reduce((sum, e) => sum + Number(e.amount || 0), 0);
+
+    return send(res, true, 200, "My commission summary", {
+      resellerId,
+      commissionRate: 10.0,
+      totalEarned: commissionCredits,
+      totalPaidOut: commissionPayouts,
+      pendingBalance: Math.max(0, commissionCredits - commissionPayouts),
+      history: entries.filter((e) => e.referenceType?.startsWith("commission")),
+    });
+  },
+];
+

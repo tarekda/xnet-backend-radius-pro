@@ -13,14 +13,28 @@ export function isWhatsAppGroupAutoPayEnabled(): boolean {
   return true;
 }
 
+/** Strip Unicode invisible format, control, and bidirectional markers (e.g. LRM \u200E, RLM \u200F, BOM \uFEFF). */
+export function stripBidiAndControlChars(s: string): string {
+  return String(s || "").replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u00AD]/g, "");
+}
+
+/** Strip stray currency signs and leading/trailing punctuation from extracted names. */
+export function cleanExtractedName(raw: string): string {
+  return stripBidiAndControlChars(raw)
+    .replace(/[$€£]/g, "") // strip any stray currency signs
+    .replace(/^[\s\-\*\•\–—#\.\,\:\;\(\)\[\]\'\"]+|[\s\-\*\•\–—#\.\,\:\;\(\)\[\]\'\"]+$/g, "")
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u00AD]/g, "")
+    .trim();
+}
+
 export function normalizePaymentLookupKey(raw: string): string {
-  let s = raw.trim().replace(/\s+/g, " ").toLowerCase();
+  let s = cleanExtractedName(raw).toLowerCase().replace(/\s+/g, " ");
   // Arabic: strip diacritics and unify common letter variants for name matching
   s = s.replace(/[\u064B-\u065F\u0670]/g, "");
   s = s.replace(/[إأآٱ]/g, "ا");
   s = s.replace(/ى/g, "ي");
   s = s.replace(/ة/g, "ه");
-  return s;
+  return s.trim();
 }
 
 export function splitNameTokens(raw: string): string[] {
@@ -29,6 +43,29 @@ export function splitNameTokens(raw: string): string[] {
 
 export function subscriberIdentityKey(inv: Pick<ExternalInvoice, "username" | "fullName">): string {
   return `${normalizePaymentLookupKey(inv.username)}::${normalizePaymentLookupKey(inv.fullName)}`;
+}
+
+/** Strips Arabic definite article 'ال' for root comparison. */
+export function stripArabicDefiniteArticle(token: string): string {
+  const t = token.trim();
+  if (t.startsWith("ال") && t.length >= 4) {
+    return t.slice(2);
+  }
+  return t;
+}
+
+/** Matches two name tokens allowing for diacritics, letter variants, and 'ال' definite article. */
+export function arabicTokenMatches(a: string, b: string): boolean {
+  const normA = normalizePaymentLookupKey(a);
+  const normB = normalizePaymentLookupKey(b);
+  if (normA === normB) return true;
+  if (!normA || !normB) return false;
+
+  const bareA = stripArabicDefiniteArticle(normA);
+  const bareB = stripArabicDefiniteArticle(normB);
+  if (bareA === bareB) return true;
+
+  return false;
 }
 
 /**
@@ -50,28 +87,63 @@ export function collectorNameMatchesInvoiceName(
 
   const collectorTokens = splitNameTokens(collectorName);
   const fullTokens = splitNameTokens(fullName);
+
+  // When collector sends 2 or more tokens without middle name(s):
+  // Check if first token and last token match the invoice's first and last token
   if (collectorTokens.length >= 2 && fullTokens.length >= 2) {
     const cFirst = collectorTokens[0];
     const cLast = collectorTokens[collectorTokens.length - 1];
     const fFirst = fullTokens[0];
     const fLast = fullTokens[fullTokens.length - 1];
-    if (cFirst === fFirst && cLast === fLast) return true;
-    if (cFirst === fLast && cLast === fFirst) return true;
+    if (arabicTokenMatches(cFirst, fFirst) && arabicTokenMatches(cLast, fLast)) return true;
+    if (arabicTokenMatches(cFirst, fLast) && arabicTokenMatches(cLast, fFirst)) return true;
   }
+
+  // When collector sends 2 tokens (e.g. first + middle, or first + last with different order)
   if (collectorTokens.length === 2 && fullTokens.length >= 2) {
-    const fullSet = new Set(fullTokens);
-    if (fullSet.has(collectorTokens[0]) && fullSet.has(collectorTokens[1])) return true;
+    const hasFirst = fullTokens.some((ft) => arabicTokenMatches(collectorTokens[0], ft));
+    const hasLast = fullTokens.some((ft) => arabicTokenMatches(collectorTokens[1], ft));
+    if (hasFirst && hasLast) return true;
+  }
+
+  // If collector sends 3+ tokens, ensure all collector tokens exist in the full name
+  if (collectorTokens.length >= 2 && fullTokens.length >= collectorTokens.length) {
+    const allMatch = collectorTokens.every((ct) =>
+      fullTokens.some((ft) => arabicTokenMatches(ct, ft))
+    );
+    if (allMatch) return true;
+  }
+
+  if (username) {
+    const uClean = username.toLowerCase().replace(/[^a-z0-9\u0600-\u06FF]/g, " ").replace(/\s+/g, " ").trim();
+    if (uClean === lookup) return true;
+    const uTokens = splitNameTokens(uClean);
+    if (collectorTokens.length >= 2 && uTokens.length >= 2) {
+      if (
+        arabicTokenMatches(collectorTokens[0], uTokens[0]) &&
+        arabicTokenMatches(collectorTokens[collectorTokens.length - 1], uTokens[uTokens.length - 1])
+      ) {
+        return true;
+      }
+    }
   }
 
   return false;
 }
 
-/** Strip staff prefixes; message body is usually just the subscriber name. */
+/** Strip staff prefixes, list numbering/bullets, and leading currency symbols. */
 export function stripPaymentMessagePrefix(raw: string): string {
-  return String(raw || "")
-    .trim()
-    .replace(/^(paid|pay|payment|done|received|تم الدفع|دفع)[\s:\-–—]+/i, "")
-    .trim();
+  let s = stripBidiAndControlChars(raw).trim();
+  // Strip markdown/list bullets and numbering (e.g. "1.", "1-", "•", "-", "*")
+  s = s.replace(/^(\d+[\.\)\-:\s]+|[\-\*\•\–—#\s]+)/, "").trim();
+  // Strip currency prefixes at line start (e.g. "$", "€", "£", "$ ")
+  s = s.replace(/^[\$€£\s]+/, "").trim();
+  s = stripBidiAndControlChars(s).trim();
+  // Strip staff keywords (e.g. "paid:", "تم الدفع:", "payment:")
+  s = s.replace(/^(paid|pay|payment|done|received|تم الدفع|دفع)[\s:\-–—]+/i, "").trim();
+  // Strip currency symbol again in case format was "paid: $name"
+  s = s.replace(/^[\$€£\s]+/, "").trim();
+  return stripBidiAndControlChars(s).trim();
 }
 
 /** Convert Arabic-Indic / Persian digits and decimal separators to ASCII for amount parsing. */
@@ -86,10 +158,11 @@ export function normalizeAmountDigits(raw: string): string {
 
 /** Parse trailing numeric token as paid amount (e.g. 25, 25.5, ٢٥, ٢٥٫٥, 0, 0$, $0). */
 export function parseTrailingPaidAmount(token: string): number | null {
-  let t = String(token || "").trim();
+  let t = stripBidiAndControlChars(token).trim();
   if (!t) return null;
   t = t.replace(/[$€£\s]/g, "");
   t = normalizeAmountDigits(t);
+  t = stripBidiAndControlChars(t).trim();
   if (t.includes(",") && !t.includes(".")) {
     t = t.replace(",", ".");
   } else if (t.includes(",") && t.includes(".")) {
@@ -110,8 +183,10 @@ export function parseTrailingPaidAmount(token: string): number | null {
 export type WhatsAppPaymentLine = { name: string; amount: number | null };
 
 /**
- * One line: subscriber name, optional amount as the last token.
+ * One line: subscriber name, optional amount as the last (or first) token.
  * Example: `طارق دعبول 25` → name `طارق دعبول`, amount 25
+ * Example: `$علي الشعار ٣٥` → name `علي الشعار`, amount 35
+ * Example: `$35 علي الشعار` → name `علي الشعار`, amount 35
  * Example: `سامر دندش 0$` → name `سامر دندش`, amount null (pay invoice in full)
  */
 export function parsePaymentLineFromPart(raw: string): WhatsAppPaymentLine | null {
@@ -122,17 +197,30 @@ export function parsePaymentLineFromPart(raw: string): WhatsAppPaymentLine | nul
 
   const parts = text.split(/\s+/).filter(Boolean);
   if (parts.length >= 2) {
+    // Case 1: Trailing amount (e.g. "علي الشعار 35", "$علي الشعار ٣٥", "علي الشعار $35")
     const last = parts[parts.length - 1];
-    const amount = parseTrailingPaidAmount(last);
-    if (amount !== null) {
-      const name = parts.slice(0, -1).join(" ").trim();
+    const trailingAmount = parseTrailingPaidAmount(last);
+    if (trailingAmount !== null) {
+      const name = cleanExtractedName(parts.slice(0, -1).join(" "));
       if (name) {
-        return { name, amount: amount > 0 ? amount : null };
+        return { name, amount: trailingAmount > 0 ? trailingAmount : null };
+      }
+    }
+
+    // Case 2: Leading amount (e.g. "$35 علي الشعار", "35$ علي الشعار", "٣٥ علي الشعار")
+    const first = parts[0];
+    const leadingAmount = parseTrailingPaidAmount(first);
+    if (leadingAmount !== null) {
+      const name = cleanExtractedName(parts.slice(1).join(" "));
+      if (name) {
+        return { name, amount: leadingAmount > 0 ? leadingAmount : null };
       }
     }
   }
 
-  return { name: text, amount: null };
+  const name = cleanExtractedName(text);
+  if (!name) return null;
+  return { name, amount: null };
 }
 
 /** Strip staff prefixes; message body is usually just the subscriber name. */
@@ -218,12 +306,25 @@ function unpaidExternalInvoiceQb(repo: Repository<ExternalInvoice>) {
  * Matching normalizes ة→ه, but MySQL stores the original letter — search both forms.
  */
 export function expandArabicSqlToken(token: string): string[] {
-  const base = String(token || "")
+  const base = stripBidiAndControlChars(token)
     .trim()
     .replace(/[%_]/g, "")
     .toLowerCase();
   if (!base) return [];
+
   const out = new Set<string>([base, normalizePaymentLookupKey(base)]);
+
+  // Expand with and without Arabic definite article "ال" (e.g. الشعار <-> شعار)
+  for (const t of [...out]) {
+    if (!t) continue;
+    if (t.startsWith("ال") && t.length >= 4) {
+      out.add(t.slice(2));
+    } else if (!t.startsWith("ال") && /^[\u0600-\u06FF]/.test(t)) {
+      out.add(`ال${t}`);
+    }
+  }
+
+  // Expand ة/ه and ي/ى variants
   for (const t of [...out]) {
     if (!t) continue;
     if (t.endsWith("ه")) out.add(`${t.slice(0, -1)}ة`);
@@ -231,23 +332,31 @@ export function expandArabicSqlToken(token: string): string[] {
     if (t.endsWith("ي")) out.add(`${t.slice(0, -1)}ى`);
     if (t.endsWith("ى")) out.add(`${t.slice(0, -1)}ي`);
   }
+
   return [...out].filter(Boolean);
 }
 
 async function fetchUnpaidCandidatesForCollectorName(name: string): Promise<ExternalInvoice[]> {
+  const cleanName = cleanExtractedName(name);
   // Prefer raw whitespace tokens so SQL sees original ة/ي before JS normalization.
-  const rawTokens = String(name || "")
+  const rawTokens = String(cleanName || "")
     .trim()
     .replace(/\s+/g, " ")
     .split(/\s+/)
+    .map((t) => cleanExtractedName(t))
     .filter(Boolean);
-  const tokens = rawTokens.length ? rawTokens : splitNameTokens(name);
+  const tokens = rawTokens.length ? rawTokens : splitNameTokens(cleanName);
   if (!tokens.length) return [];
 
   const repo = AppDataSource.getRepository(ExternalInvoice);
   let qb = unpaidExternalInvoiceQb(repo);
 
-  tokens.forEach((tok, idx) => {
+  // When collector sends name without middle name (e.g. "علي الشعار"),
+  // search by first name AND last name in SQL so candidates with middle names in DB match.
+  const searchTokens =
+    tokens.length >= 2 ? [tokens[0], tokens[tokens.length - 1]] : tokens;
+
+  searchTokens.forEach((tok, idx) => {
     const variants = expandArabicSqlToken(tok);
     if (!variants.length) return;
     const parts = variants.flatMap((_, vIdx) => [

@@ -7,7 +7,18 @@ import { getJwtSecret } from '../config/requireSecrets';
 import { mfaRequiredForRole } from '../services/mfaService';
 import { isMfaEnrollmentAllowedPath } from './mfaEnrollment';
 
+import crypto from 'crypto';
+
 const jwtSecret = getJwtSecret();
+
+/**
+ * Computes a lightweight client session fingerprint from User-Agent.
+ * Used to detect token theft or hijacked bearer credentials.
+ */
+export function computeClientFingerprint(req: Request): string {
+  const ua = String(req.headers['user-agent'] || 'unknown').slice(0, 128);
+  return crypto.createHash('sha256').update(ua).digest('hex').slice(0, 16);
+}
 
 export const authenticateToken = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   const authHeader = req.headers['authorization'];
@@ -20,6 +31,22 @@ export const authenticateToken = async (req: Request, res: Response, next: NextF
 
   try {
     const decoded: any = jwt.verify(token, jwtSecret);
+
+    // Verify session client fingerprint if present
+    if (decoded?.fingerprint) {
+      const currentFp = computeClientFingerprint(req);
+      if (decoded.fingerprint !== currentFp) {
+        const strict = String(process.env.STRICT_SESSION_FINGERPRINT || "false").toLowerCase() === "true";
+        if (strict) {
+          res.status(401).json({
+            success: false,
+            code: "SESSION_FINGERPRINT_MISMATCH",
+            message: "Session validation failed: client fingerprint mismatch.",
+          });
+          return;
+        }
+      }
+    }
     let role = decoded?.role as SystemUsers['role'] | undefined;
     let id = decoded?.id as number | undefined;
     let resellerId = decoded?.resellerId as number | null | undefined;

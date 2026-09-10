@@ -1,6 +1,6 @@
 // src/routes/invoice.routes.ts
 import { Router } from "express";
-import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceByIdHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, getProviderMacListHandler, getProviderMacOptionsHandler, syncProviderMacAddressesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, sharePaidExternalInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler, previewMyISPInvoicesHandler, importMyISPInvoicesHandler, previewMyISP2InvoicesHandler, importMyISP2InvoicesHandler, previewRadiusInvoicesHandler, importRadiusInvoicesHandler, previewIDMInvoicesHandler, importIDMInvoicesHandler, previewTerraInvoicesHandler, importTerraInvoicesHandler, previewTerra2InvoicesHandler, importTerra2InvoicesHandler, previewMispInvoicesHandler, importMispInvoicesHandler } from "../controllers/invoiceController";
+import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceByIdHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, getProviderMacListHandler, getProviderMacOptionsHandler, syncProviderMacAddressesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, sharePaidExternalInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler, getSubscriberDunningEnforcementHandler, restoreSubscriberLineHandler, previewMyISPInvoicesHandler, importMyISPInvoicesHandler, previewMyISP2InvoicesHandler, importMyISP2InvoicesHandler, previewRadiusInvoicesHandler, importRadiusInvoicesHandler, previewIDMInvoicesHandler, importIDMInvoicesHandler, previewTerraInvoicesHandler, importTerraInvoicesHandler, previewTerra2InvoicesHandler, importTerra2InvoicesHandler, previewMispInvoicesHandler, importMispInvoicesHandler } from "../controllers/invoiceController";
 import {
   dismissWhatsappPaymentAmbiguityHandler,
   listWhatsappPaymentAmbiguitiesHandler,
@@ -9,7 +9,15 @@ import {
 import {
   getInboundWhatsAppMessagesHandler,
   retryInboundWhatsAppMessageHandler,
+  resolveInboundWhatsAppMessageHandler,
 } from "../controllers/whatsappInboundController";
+import {
+  uploadAndScanReceiptHandler,
+  confirmReceiptReconciliationHandler,
+} from "../controllers/receiptUploadController";
+import { simulateInboundAgentMessageHandler } from "../controllers/whatsappWebhookController";
+import fs from "fs";
+import path from "path";
 import multer from "multer";
 import { authenticateToken, authorizeAnyPermissions, authorizePermissions, authorizeRoles } from '../middleware/authMiddleware';
 const upload = multer({
@@ -34,6 +42,32 @@ const upload = multer({
       return;
     }
     cb(null, true);
+  },
+});
+
+const receiptStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    const dir = path.join(process.cwd(), "uploads", "receipts");
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    cb(null, dir);
+  },
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname) || ".jpg";
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, `receipt-${uniqueSuffix}${ext}`);
+  },
+});
+const uploadReceipt = multer({
+  storage: receiptStorage,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype.startsWith("image/") || file.mimetype === "application/pdf") {
+      cb(null, true);
+    } else {
+      cb(new Error("Only image files or PDFs are allowed for receipts"));
+    }
   },
 });
 
@@ -186,6 +220,34 @@ router.post(
   authorizePermissions("billing.externalInvoices.pay"),
   retryInboundWhatsAppMessageHandler
 );
+router.post(
+  "/external/whatsapp-inbound-messages/:id/resolve",
+  authenticateToken,
+  authorizePermissions("billing.externalInvoices.pay"),
+  resolveInboundWhatsAppMessageHandler
+);
+router.post(
+  "/external/whatsapp/simulate",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.pay"
+  ),
+  simulateInboundAgentMessageHandler
+);
+router.post(
+  "/external/receipt-ocr/upload-test",
+  authenticateToken,
+  authorizePermissions("billing.externalInvoices.pay"),
+  uploadReceipt.single("receipt"),
+  uploadAndScanReceiptHandler
+);
+router.post(
+  "/external/receipt-ocr/confirm",
+  authenticateToken,
+  authorizePermissions("billing.externalInvoices.pay"),
+  confirmReceiptReconciliationHandler
+);
 router.get(
   "/external/:invoiceId/history",
   authenticateToken,
@@ -253,6 +315,26 @@ router.post(
   authorizePermissions("billing.externalInvoices.dunning"),
   runExternalDunningHandler
 );
+router.get(
+  "/external/dunning/subscriber-state/:username",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.dunning",
+    "users.view"
+  ),
+  getSubscriberDunningEnforcementHandler
+);
+router.post(
+  "/external/dunning/restore-line/:username",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.pay",
+    "billing.externalInvoices.dunning",
+    "users.edit"
+  ),
+  restoreSubscriberLineHandler
+);
 router.put(
   "/external/:invoiceId",
   authenticateToken,
@@ -276,6 +358,26 @@ router.get(
     "billing.externalInvoices.unpay"
   ),
   getExternalInvoicePaymentLinesHandler
+);
+router.get(
+  "/external/trend",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.viewTotals",
+    "admin.analytics.view"
+  ),
+  getExternalInvoicesTrendHandler
+);
+router.get(
+  "/external/aging-summary",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.viewTotals",
+    "admin.analytics.view"
+  ),
+  getExternalInvoicesAgingSummaryHandler
 );
 router.get(
   "/external/:invoiceId",

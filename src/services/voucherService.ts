@@ -3,6 +3,7 @@ import { redisClient } from "../redisClient";
 import { AppDataSource } from "../db/config";
 import { Raduserprofile } from "../db/entities/Raduserprofile";
 import { Radprofile } from "../db/entities/Radprofile";
+import { radiusAuthCacheService } from "./radiusAuthCacheService";
 
 export interface VoucherCard {
   id: string;
@@ -257,6 +258,11 @@ export const voucherService = {
           targetUser.profileId = card.profileId;
         }
         await userRepo.save(targetUser);
+
+        // Invalidate auth cache so subscriber gets immediate network access
+        await radiusAuthCacheService.invalidateUserCache(username.trim()).catch((err) => {
+          console.warn("[vouchers] cache invalidation failed:", err);
+        });
       }
     } catch (dbErr) {
       console.error("Error updating user subscription on voucher redemption:", dbErr);

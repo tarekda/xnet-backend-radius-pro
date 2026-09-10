@@ -17,6 +17,9 @@ export interface AccountingUpdatePayload {
 }
 
 const REDIS_QUEUE_KEY = "radius:accounting:queue";
+const REDIS_DLQ_KEY = "radius:accounting:dlq";
+/** Maximum items retained in the dead-letter queue before oldest are evicted. */
+const DLQ_MAX_LEN = 1000;
 
 export class RadiusAccountingQueueService {
   private isProcessing: boolean = false;
@@ -57,6 +60,9 @@ export class RadiusAccountingQueueService {
     this.timer = setInterval(() => {
       this.flushQueue();
     }, this.flushIntervalMs);
+    // .unref() lets the process exit cleanly during tests and graceful shutdown
+    // without waiting for the next flush tick.
+    this.timer.unref();
   }
 
   stopAutoFlush() {
@@ -97,7 +103,17 @@ export class RadiusAccountingQueueService {
         try {
           payloads.push(JSON.parse(raw));
         } catch {
-          // ignore corrupted payload
+          // Route corrupted payloads to DLQ instead of silently dropping them.
+          console.warn("[RadiusAccountingQueue] Corrupt payload moved to DLQ:", raw?.slice?.(0, 200));
+          try {
+            if (redisClient && redisClient.isOpen) {
+              await redisClient.rPush(REDIS_DLQ_KEY, JSON.stringify({ raw, movedAt: new Date().toISOString() }));
+              // Trim to keep DLQ bounded
+              await redisClient.lTrim(REDIS_DLQ_KEY, -DLQ_MAX_LEN, -1);
+            }
+          } catch (dlqErr) {
+            console.error("[RadiusAccountingQueue] Failed to push to DLQ:", dlqErr);
+          }
         }
       }
 
@@ -156,6 +172,22 @@ export class RadiusAccountingQueueService {
       } catch (err) {
         console.error(`[RadiusAccountingQueue] Failed to update radacct record for ${item.username}:`, err);
       }
+    }
+  }
+  /**
+   * Returns the current depth of the main queue and the dead-letter queue.
+   * Used by health-check endpoints.
+   */
+  async getQueueDepths(): Promise<{ queue: number; dlq: number }> {
+    try {
+      if (!redisClient || !redisClient.isOpen) return { queue: 0, dlq: 0 };
+      const [queue, dlq] = await Promise.all([
+        redisClient.lLen(REDIS_QUEUE_KEY),
+        redisClient.lLen(REDIS_DLQ_KEY),
+      ]);
+      return { queue, dlq };
+    } catch {
+      return { queue: -1, dlq: -1 };
     }
   }
 }

@@ -32,8 +32,29 @@ export class WhatsappInboundMessage {
   @Column("varchar", { name: "message_sid", nullable: true, length: 128 })
   messageSid!: string | null;
 
+  @Column("varchar", { name: "media_url", nullable: true, length: 512 })
+  mediaUrl!: string | null;
+
+  @Column("varchar", { name: "media_type", nullable: true, length: 64 })
+  mediaType!: string | null;
+
+  @Column("text", { name: "ocr_raw_text", nullable: true })
+  ocrRawText!: string | null;
+
+  @Column("json", { name: "ocr_extracted_data", nullable: true })
+  ocrExtractedData!: Record<string, any> | null;
+
   @Column("text", { name: "error_detail", nullable: true })
   errorDetail!: string | null;
+
+  @Column("varchar", { name: "intent", nullable: true, length: 64 })
+  intent!: string | null;
+
+  @Column("text", { name: "reply_text", nullable: true })
+  replyText!: string | null;
+
+  @Column("varchar", { name: "matched_username", nullable: true, length: 64 })
+  matchedUsername!: string | null;
 
   @Column("timestamp", {
     name: "created_at",
