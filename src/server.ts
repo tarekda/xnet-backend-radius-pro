@@ -20,7 +20,8 @@ import 'reflect-metadata';
 import profileRoutes from './routes/profileRoutes';
 import sessionRoutes from './routes/sessionRoutes';
 import { createServer } from 'http';
-import { startConsumer } from './bus/userActionsConsumer';
+import { startConsumer, type UserActionsConsumer } from './bus/userActionsConsumer';
+import { closeEventBus } from './bus/eventBusSingleton';
 import nasRoutes from './routes/nasRoutes';
 import cron from "node-cron";
 import { generateMonthlyInvoices } from './services/invoiceService';
@@ -52,7 +53,7 @@ import cors from 'cors';
 import { beginShutdown } from './state/shutdown';
 import { redisClient } from './redisClient';
 import { AppDataSource } from './db/config';
-import { metricsMiddleware, register, setWebsocketClients } from './metrics/metrics';
+import { metricsMiddleware, recordJobRun, register, setWebsocketClients } from './metrics/metrics';
 import { startBackupScheduler } from "./backups/scheduler";
 import { runExpirySessionDisconnectJob } from "./jobs/expirySessionDisconnectJob";
 import { startConnectionLogsMaintenanceScheduler } from "./jobs/connectionLogsMaintenance";
@@ -271,7 +272,15 @@ app.use('/api/push', pushRoutes);
 
 const monthlyInvoiceTask = cron.schedule("0 0 1 * *", async () => {
     console.log("Running monthly invoice generation...");
-    await generateMonthlyInvoices();
+    try {
+      await generateMonthlyInvoices();
+      recordJobRun("monthly_invoice_generation", "ok");
+    } catch (err) {
+      // Month-end is the most consequential run of the month, so an unhandled
+      // rejection here would fail silently with nothing to alert on.
+      recordJobRun("monthly_invoice_generation", "error");
+      console.error("[monthly-invoice] run failed", err);
+    }
   });
 
 const dunningCronExpr = String(process.env.DUNNING_CRON ?? "").trim();
@@ -328,9 +337,14 @@ app.get('/', (req, res) => {
 app.use(errorHandler);
 
 // Start the consumer in the background (disable with START_USER_ACTIONS_CONSUMER=0 when using worker profile)
+let userActionsConsumer: UserActionsConsumer | null = null;
 const startConsumerFlag = String(process.env.START_USER_ACTIONS_CONSUMER ?? "1").toLowerCase();
 if (startConsumerFlag !== "0" && startConsumerFlag !== "false") {
-  startConsumer().catch((err) => console.error("Consumer error:", err));
+  startConsumer()
+    .then((consumer) => {
+      userActionsConsumer = consumer;
+    })
+    .catch((err) => console.error("Consumer error:", err));
 } else {
   console.log("user_actions consumer disabled in this process (START_USER_ACTIONS_CONSUMER=0)");
 }
@@ -460,6 +474,13 @@ async function shutdown(signal: string) {
     try {
       sessionWatcher.stop();
     } catch {}
+
+    // Close RabbitMQ before the datasource, so an in-flight user_actions
+    // message is not dropped half-handled and the broker sees a clean cancel.
+    try {
+      if (userActionsConsumer) await userActionsConsumer.close();
+    } catch {}
+    await closeEventBus();
 
     // Stop accepting new HTTP connections
     await new Promise<void>((resolve) => {

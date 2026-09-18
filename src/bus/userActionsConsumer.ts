@@ -1,5 +1,5 @@
 // userActionsConsumer.ts
-import amqp, { Channel, ConsumeMessage } from "amqplib";
+import amqp, { Channel, ChannelModel, ConsumeMessage } from "amqplib";
 import { AppDataSource } from "../db/config";
 import { UserController } from "../controllers/userController";
 import {
@@ -46,7 +46,14 @@ async function publishRetry(channel: Channel, msg: ConsumeMessage, err: unknown)
   channel.ack(msg);
 }
 
-export async function startConsumer() {
+/** Handle for the running consumer, so shutdown can cancel it cleanly. */
+export type UserActionsConsumer = {
+  connection: ChannelModel;
+  channel: Channel;
+  close: () => Promise<void>;
+};
+
+export async function startConsumer(): Promise<UserActionsConsumer> {
   const rabbitMqUrl = process.env.RABBITMQ_URL || "amqp://127.0.0.1:5672";
   const connection = await amqp.connect(rabbitMqUrl);
   connection.on("error", (err) => {
@@ -55,9 +62,24 @@ export async function startConsumer() {
 
   const channel = await openUserActionsChannel(connection);
   await channel.prefetch(1);
+
+  // Shutdown must not fail on a socket that is already gone.
+  const close = async (): Promise<void> => {
+    try {
+      await channel.close();
+    } catch (err) {
+      console.warn("user_actions channel close failed:", err instanceof Error ? err.message : err);
+    }
+    try {
+      await connection.close();
+    } catch (err) {
+      console.warn("user_actions connection close failed:", err instanceof Error ? err.message : err);
+    }
+  };
+
   console.log(`Waiting for messages in ${QUEUE} (DLQ=${DLQ}, maxRetries=${MAX_RETRIES})...`);
 
-  channel.consume(QUEUE, async (msg) => {
+  await channel.consume(QUEUE, async (msg) => {
     if (msg === null) return;
 
     let message: any;
@@ -138,4 +160,6 @@ export async function startConsumer() {
       }
     }
   });
+
+  return { connection, channel, close };
 }

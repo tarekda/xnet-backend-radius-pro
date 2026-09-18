@@ -67,6 +67,21 @@ const quotaResetsTotal = new client.Counter({
   registers: [register],
 });
 
+/** Background job health, so a silent cron failure is visible in Grafana. */
+const jobRunsTotal = new client.Counter({
+  name: "job_runs_total",
+  help: "Background job runs by job name and outcome",
+  labelNames: ["job", "result"] as const,
+  registers: [register],
+});
+
+const jobLastRunTimestamp = new client.Gauge({
+  name: "job_last_run_timestamp_seconds",
+  help: "Unix timestamp of the last completed run of each background job",
+  labelNames: ["job"] as const,
+  registers: [register],
+});
+
 export function setWebsocketClients(count: number) {
   websocketClients.set(count);
 }
@@ -93,6 +108,15 @@ export function recordDunningRun(result: "ok" | "error", actions?: Record<string
 
 export function recordQuotaReset(scope: "daily" | "monthly", result: "ok" | "error") {
   quotaResetsTotal.inc({ scope, result });
+}
+
+/**
+ * Records the outcome of a background job. The timestamp lets an alert fire on
+ * "job has not completed successfully in N hours" rather than only on errors.
+ */
+export function recordJobRun(job: string, result: "ok" | "error") {
+  jobRunsTotal.inc({ job, result });
+  jobLastRunTimestamp.set({ job }, Date.now() / 1000);
 }
 
 function getRouteLabel(req: Request): string {
