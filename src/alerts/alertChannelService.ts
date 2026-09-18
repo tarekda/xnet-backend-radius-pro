@@ -1,10 +1,10 @@
 import axios from "axios";
 import { AppDataSource } from "../db/config";
 import { AlertIncident } from "../db/entities/AlertIncident";
-import { AlertSettings } from "../db/entities/AlertSettings";
 import { alertNotificationService } from "../services/alertNotificationService";
-import { DEFAULT_ALERT_SETTINGS, type AlertSettingsPayload } from "./alertMetrics";
 import { CircuitBreakerRegistry } from "../utils/circuitBreaker";
+import { emailConfigSummary, sendEmail, type EmailConfigSummary } from "../services/emailService";
+import { sendSms, smsConfigSummary, type SmsConfigSummary } from "../services/smsService";
 
 export type NotificationChannel = "webhook" | "email" | "sms" | "whatsapp" | "slack";
 
@@ -20,6 +20,81 @@ export interface MultiChannelDispatchReport {
   results: ChannelDispatchResult[];
   escalationLevel?: number;
   dispatchedAt: string;
+}
+
+export interface ChannelConfigurationReport {
+  email: EmailConfigSummary;
+  sms: SmsConfigSummary;
+}
+
+function escapeHtml(value: unknown): string {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function severityColor(severity: string): string {
+  switch (severity) {
+    case "critical":
+      return "#e11d48";
+    case "high":
+      return "#ea580c";
+    case "medium":
+      return "#d97706";
+    default:
+      return "#2563eb";
+  }
+}
+
+/** Plain-text rendering used by both the email and SMS channels. */
+function renderIncidentText(
+  incident: AlertIncident,
+  eventType: "created" | "escalated" | "resolved",
+  escalationLevel: number
+): string {
+  return [
+    `Rule: ${incident.ruleName}`,
+    `Severity: ${incident.severity.toUpperCase()}`,
+    `Event: ${eventType}${eventType === "escalated" ? ` (level ${escalationLevel})` : ""}`,
+    `Metric: ${incident.metric}`,
+    `Value: ${incident.value} (threshold ${incident.threshold})`,
+    `Message: ${incident.message}`,
+    `Timestamp: ${new Date(incident.timestamp).toUTCString()}`,
+  ].join("\n");
+}
+
+function renderIncidentHtml(
+  incident: AlertIncident,
+  eventType: "created" | "escalated" | "resolved",
+  escalationLevel: number
+): string {
+  const color = severityColor(incident.severity);
+  const rows: Array<[string, string]> = [
+    ["Severity", incident.severity.toUpperCase()],
+    ["Event", eventType === "escalated" ? `${eventType} (level ${escalationLevel})` : eventType],
+    ["Metric", incident.metric],
+    ["Value / threshold", `${incident.value} / ${incident.threshold}`],
+    ["Timestamp", new Date(incident.timestamp).toUTCString()],
+  ];
+
+  return `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:600px">
+  <div style="border-left:4px solid ${color};padding:12px 16px;background:#f8fafc">
+    <h2 style="margin:0 0 4px;font-size:16px;color:#0f172a">${escapeHtml(incident.ruleName)}</h2>
+    <div style="font-size:12px;font-weight:600;color:${color}">${escapeHtml(incident.severity.toUpperCase())}</div>
+  </div>
+  <p style="margin:12px 0;color:#334155;font-size:14px">${escapeHtml(incident.message)}</p>
+  <table style="border-collapse:collapse;width:100%;font-size:13px">
+    ${rows
+      .map(
+        ([label, value]) =>
+          `<tr><td style="padding:6px 8px;color:#64748b;white-space:nowrap">${escapeHtml(label)}</td><td style="padding:6px 8px;color:#0f172a;font-weight:500">${escapeHtml(value)}</td></tr>`
+      )
+      .join("")}
+  </table>
+  <p style="margin-top:16px;font-size:11px;color:#94a3b8">XNet RADIUS Pro alerting</p>
+</div>`;
 }
 
 export class AlertChannelService {
@@ -164,7 +239,8 @@ export class AlertChannelService {
   }
 
   /**
-   * Dispatches Email notifications.
+   * Dispatches Email notifications over the configured SMTP transport.
+   * Uses its own circuit breaker so a mail outage cannot trip other channels.
    */
   async dispatchEmail(
     incident: AlertIncident,
@@ -172,27 +248,43 @@ export class AlertChannelService {
     recipients: string[],
     escalationLevel = 1
   ): Promise<ChannelDispatchResult> {
+    const target = recipients.join(", ");
+    const subject = `[${incident.severity.toUpperCase()}${eventType === "escalated" ? ` ESCALATION L${escalationLevel}` : ""}] ${incident.ruleName}`;
+
+    const breaker = CircuitBreakerRegistry.get("email_smtp");
     try {
-      const subject = `[${incident.severity.toUpperCase()}${eventType === "escalated" ? ` ESCALATION L${escalationLevel}` : ""}] ${incident.ruleName}`;
-      console.log(`[alert-channel] Simulated email dispatch to ${recipients.length} recipients: ${subject}`);
-      // If an SMTP transporter is configured, this integrates with nodemailer / sendgrid
-      return {
-        channel: "email",
-        success: true,
-        target: recipients.join(", "),
-      };
+      return await breaker.execute(async () => {
+        const result = await sendEmail({
+          to: recipients,
+          subject,
+          text: renderIncidentText(incident, eventType, escalationLevel),
+          html: renderIncidentHtml(incident, eventType, escalationLevel),
+        });
+
+        if (!result.sent) {
+          console.warn(`[alert-channel] Email dispatch failed: ${result.reason}`);
+          return { channel: "email" as const, success: false, target, error: result.reason };
+        }
+
+        if (result.rejected.length > 0) {
+          // Partial delivery: SMTP accepted the message but refused some mailboxes.
+          console.warn(`[alert-channel] Email rejected for: ${result.rejected.join(", ")}`);
+        }
+
+        return { channel: "email" as const, success: true, target };
+      });
     } catch (err: any) {
       return {
         channel: "email",
         success: false,
-        target: recipients.join(", "),
+        target,
         error: err?.message || String(err),
       };
     }
   }
 
   /**
-   * Dispatches SMS / WhatsApp notifications.
+   * Dispatches SMS notifications through Twilio.
    */
   async dispatchSms(
     incident: AlertIncident,
@@ -200,22 +292,45 @@ export class AlertChannelService {
     recipients: string[],
     escalationLevel = 1
   ): Promise<ChannelDispatchResult> {
+    const target = recipients.join(", ");
+    const prefix = eventType === "escalated" ? `ESCALATION L${escalationLevel} ` : "";
+    const body = `XNet Alert [${incident.severity.toUpperCase()}] ${prefix}${incident.ruleName}: ${incident.message}`;
+
+    const breaker = CircuitBreakerRegistry.get("sms_twilio");
     try {
-      const body = `XNet Alert [${incident.severity.toUpperCase()}]: ${incident.message}`;
-      console.log(`[alert-channel] Simulated SMS dispatch to ${recipients.length} numbers: ${body}`);
-      return {
-        channel: "sms",
-        success: true,
-        target: recipients.join(", "),
-      };
+      return await breaker.execute(async () => {
+        const result = await sendSms({ to: recipients, body });
+
+        if (!result.sent) {
+          console.warn(`[alert-channel] SMS dispatch failed: ${result.reason}`);
+          return { channel: "sms" as const, success: false, target, error: result.reason };
+        }
+
+        if (result.failed.length > 0) {
+          console.warn(`[alert-channel] SMS failed for: ${result.failed.join(", ")}`);
+        }
+
+        return { channel: "sms" as const, success: true, target };
+      });
     } catch (err: any) {
       return {
         channel: "sms",
         success: false,
-        target: recipients.join(", "),
+        target,
         error: err?.message || String(err),
       };
     }
+  }
+
+  /**
+   * Reports which outbound channels are usable, plus the reason any are not.
+   * Exposes no secrets — safe to return from an admin endpoint.
+   */
+  describeChannels(): ChannelConfigurationReport {
+    return {
+      email: emailConfigSummary(),
+      sms: smsConfigSummary(),
+    };
   }
 
   /**

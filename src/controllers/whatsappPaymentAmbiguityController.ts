@@ -1,4 +1,4 @@
-import { Request, RequestHandler, Response } from "express";
+import { RequestHandler, Response } from "express";
 import {
   dismissWhatsappPaymentAmbiguity,
   listWhatsappPaymentAmbiguities,

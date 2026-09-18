@@ -5,10 +5,8 @@ import { Radprofile } from '../db/entities/Radprofile';
 import { body, validationResult } from 'express-validator';
 import { redisClient } from "../redisClient"
 import { UserMac } from '../db/entities/UserMac';
-import { Radusagestats } from '../db/entities/Radusagestats';
 import { Radcheck } from '../db/entities/Radcheck';
 import { writeAuditLog } from '../audit/writeAuditLog';
-import { promisify } from "util";
 import { exec } from 'child_process';
 import util from "util";
 import radius from "radius";
@@ -23,11 +21,10 @@ import { SessionTracking } from '../db/entities/SessionTracking';
 import { Invoices } from '../db/entities/Invoices';
 import { Radacct } from '../db/entities/Radacct';
 import { Nas } from '../db/entities/Nas';
-import { parseDateOnlyField, sqlMonthlyCycleResetAt, sqlMonthlyCycleStart } from '../utils/quotaCycle';
+import { parseDateOnlyField, sqlMonthlyCycleStart } from '../utils/quotaCycle';
 import { getQuotaUsageForUsers } from '../utils/quotaUsage';
 import { readOnlineSessionConfig, sqlRadacctIsOnline, sqlRadacctLastUpdate } from '../utils/onlineSessionPolicy';
-import { Brackets } from 'typeorm';
-import { radiusAuthCacheService } from '../services/radiusAuthCacheService';
+import { Brackets, SelectQueryBuilder } from 'typeorm';
 
 
 
@@ -158,20 +155,6 @@ function addCalendarMonths(from: Date, months: number): Date {
     d.setMonth(d.getMonth() + months);
     if (d.getDate() !== day) d.setDate(0);
     return d;
-}
-
-function formatUsersWithStatus(entities: any, raw: any) {
-    return entities.map((user: any, index: number) => ({
-        ...user,
-        // TypeORM raw values may be boolean/number/string depending on driver
-        isOnline: raw[index].isOnline === true || raw[index].isOnline === 1 || raw[index].isOnline === "1",
-        // TypeORM raw aliases can vary depending on driver/casing; accept common shapes
-        lastTimeActive:
-            raw[index].lastTimeActive ??
-            raw[index].lasttimeactive ??
-            raw[index].last_time_active ??
-            null,
-    }));
 }
 
 async function getFreshUsersStatusMap(
@@ -317,6 +300,61 @@ function withQuotaExceededFlags(users: any[]): Promise<any[]> {
 }
 
 
+/* ── optional user-list filters ──────────────────────────────────────────────
+ * These must be applied in SQL so that pagination and totals reflect them.
+ * Filtering them client-side only narrowed the current page of results. */
+type ExtraUserFilters = {
+    profileName?: string;
+    quotaExceeded: boolean;
+    hasMacAddress: boolean;
+    hasContactInfo: boolean;
+};
+
+function readExtraUserFilters(req: Request): ExtraUserFilters {
+    const isTruthy = (value: unknown) => {
+        const raw = String(value ?? "").trim().toLowerCase();
+        return raw === "true" || raw === "1";
+    };
+    return {
+        profileName: String(req.query.profile ?? "").trim().toLowerCase() || undefined,
+        quotaExceeded: isTruthy(req.query.quotaExceeded),
+        hasMacAddress: isTruthy(req.query.hasMacAddress),
+        hasContactInfo: isTruthy(req.query.hasContactInfo),
+    };
+}
+
+function hasExtraUserFilters(filters: ExtraUserFilters): boolean {
+    return Boolean(
+        filters.profileName || filters.quotaExceeded || filters.hasMacAddress || filters.hasContactInfo
+    );
+}
+
+/**
+ * Applies the optional filters. The query builder must already join
+ * profile / UserMac / UserDetails under the aliases `profile`, `mac`, `userDetails`.
+ */
+function applyExtraUserFilters(qb: SelectQueryBuilder<any>, filters: ExtraUserFilters): void {
+    if (filters.profileName) {
+        qb.andWhere("LOWER(COALESCE(profile.profileName, '')) = :profileNameFilter", {
+            profileNameFilter: filters.profileName,
+        });
+    }
+    if (filters.quotaExceeded) {
+        qb.andWhere("user.isMonthlyExceeded = :quotaExceededFilter", { quotaExceededFilter: true });
+    }
+    if (filters.hasMacAddress) {
+        qb.andWhere("COALESCE(mac.macAddress, '') <> ''");
+    }
+    if (filters.hasContactInfo) {
+        qb.andWhere("(COALESCE(userDetails.email, '') <> '' OR COALESCE(userDetails.phoneNumber, '') <> '')");
+    }
+}
+
+/** Cache-key fragment so each filter combination gets its own cache entry. */
+function extraUserFilterKey(filters: ExtraUserFilters): string {
+    return `_profile_${filters.profileName ?? "all"}_quota_${filters.quotaExceeded ? "yes" : "no"}_mac_${filters.hasMacAddress ? "yes" : "no"}_contact_${filters.hasContactInfo ? "yes" : "no"}`;
+}
+
 export const UserController = {
     quotaService: new QuotaService(AppDataSource, eventBus, new CacheService()),
     getRadUsers: async (req: Request, res: Response) => {
@@ -337,8 +375,26 @@ export const UserController = {
                       ? false
                       : null;
 
+            // Server-side sorting (whitelisted columns only).
+            const sortByRaw = String(req.query.sortBy ?? "").trim();
+            const sortDir: "ASC" | "DESC" =
+                String(req.query.sortDir ?? "").trim().toLowerCase() === "desc" ? "DESC" : "ASC";
+            const SORTABLE_COLUMNS: Record<string, string> = {
+                id: "user.id",
+                username: "user.username",
+                expiresAt: "user.expiresAt",
+                accountStatus: "user.accountStatus",
+                profileName: "profile.profileName",
+                macAddress: "mac.macAddress",
+                fullName: "userDetails.fullName",
+            };
+            const sortColumn = SORTABLE_COLUMNS[sortByRaw];
+
+            const extraFilters = readExtraUserFilters(req);
+
             const scope = isReseller ? `reseller_${resellerId}` : "global";
-            const filterKey = `account_${accountStatusFilter || "all"}_online_${onlineFilter === null ? "all" : onlineFilter ? "yes" : "no"}`;
+            const sortKeyPart = sortColumn ? `_sort_${sortByRaw}_${sortDir}` : "";
+            const filterKey = `account_${accountStatusFilter || "all"}_online_${onlineFilter === null ? "all" : onlineFilter ? "yes" : "no"}${sortKeyPart}${extraUserFilterKey(extraFilters)}`;
             const cacheKey = `users_page_${scope}_${page}_limit_${limit}_${filterKey}`;
             const statusCacheKey = `users_status_${scope}_${page}_limit_${limit}_${filterKey}`;
 
@@ -397,6 +453,13 @@ export const UserController = {
                 totalUsersQb.andWhere(onlineFilter ? onlineExists : `NOT ${onlineExists}`);
                 totalUsersQb.setParameters({ staleCutoff, activeCutoff });
             }
+            if (hasExtraUserFilters(extraFilters)) {
+                totalUsersQb
+                    .leftJoin("user.profile", "profile")
+                    .leftJoin(UserMac, "mac", "user.username = mac.username")
+                    .leftJoin(UserDetails, "userDetails", "user.username = userDetails.username");
+                applyExtraUserFilters(totalUsersQb, extraFilters);
+            }
             const totalUsers = await totalUsersQb.getCount();
 
             // 🔹 Fetch users with profile relation and left join UserMac
@@ -450,7 +513,7 @@ export const UserController = {
                     "userDetails.phoneNumber",
                     "userDetails.email",
                 ])
-                .orderBy("user.id", "ASC")
+                .orderBy(sortColumn || "user.id", sortColumn ? sortDir : "ASC")
                 .limit(limit)
                 .offset(offset);
             
@@ -475,6 +538,7 @@ export const UserController = {
                 qb.andWhere(onlineFilter ? onlineExists : `NOT ${onlineExists}`);
                 qb.setParameters({ staleCutoff, activeCutoff });
             }
+            applyExtraUserFilters(qb, extraFilters);
 
             const entities = await qb.getMany();
             const pageUsernames = entities.map((u: any) => u?.username).filter(Boolean);
@@ -1006,7 +1070,7 @@ export const UserController = {
             sendResponse(res, false, 500, 'Error resetting monthly quota');
         }
     },
-    changeUserProfile: async (req: Request, res: Response) => { },
+    changeUserProfile: async (_req: Request, _res: Response) => { },
     // Disconnect a user from MikroTik so they re-auth and get their normal profile again.
     // Prefer RouterOS API (PPPoE/Hotspot). The legacy radclient flow (nasIp/secret) is kept only for backwards compat.
     disconnectUser: async (
@@ -1362,6 +1426,8 @@ export const UserController = {
                       ? false
                       : null;
 
+            const extraFilters = readExtraUserFilters(req);
+
             console.log('Received search query:', query);
 
             if (!query) {
@@ -1448,6 +1514,7 @@ export const UserController = {
                 qb.andWhere(onlineFilter ? onlineExists : `NOT ${onlineExists}`);
                 qb.setParameters({ staleCutoff, activeCutoff });
             }
+            applyExtraUserFilters(qb, extraFilters);
 
             const entities = await qb
                 .orderBy("user.id", "ASC")
@@ -2105,7 +2172,6 @@ export const UserController = {
             const { isReseller, resellerId } = getResellerFilter(req);
             const userRepository = AppDataSource.getRepository(Raduserprofile);
             const radcheckRepository = AppDataSource.getRepository(Radcheck);
-            const userDetailsRepository = AppDataSource.getRepository(UserDetails);
 
             const payload = usersRaw.map((u: any) => ({
                 username: String(u?.username ?? "").trim(),

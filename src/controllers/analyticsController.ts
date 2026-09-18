@@ -7,7 +7,7 @@ import {
   getPeakHours,
   getRevenueInsights,
 } from "../services/analyticsService";
-import { apiSuccess, apiError } from "../utils/responseBuilder";
+import { apiSuccess } from "../utils/responseBuilder";
 
 export async function usageHandler(req: Request, res: Response, next: NextFunction) {
   try {

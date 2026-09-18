@@ -51,6 +51,10 @@ import { InvoicePayment } from './entities/InvoicePayment';
 import { TopupPlan } from './entities/TopupPlan';
 import { SubscriberTopup } from './entities/SubscriberTopup';
 import { RevenueLeakageAudit } from './entities/RevenueLeakageAudit';
+import { ReportSchedule } from './entities/ReportSchedule';
+import { Ticket } from './entities/Ticket';
+import { TicketComment } from './entities/TicketComment';
+import { DeviceToken } from './entities/DeviceToken';
 
 // Create entities array with explicit references
 const entities = [
@@ -98,6 +102,10 @@ const entities = [
     TopupPlan,
     SubscriberTopup,
     RevenueLeakageAudit,
+    ReportSchedule,
+    Ticket,
+    TicketComment,
+    DeviceToken,
 ];
 
 export const AppDataSource = new DataSource({

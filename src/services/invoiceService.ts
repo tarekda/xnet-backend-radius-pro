@@ -190,25 +190,49 @@ function applyAgeBucketFilter(
     // Aging is meaningful for open items only.
     qb.andWhere(`${alias}.status IN (:...openStatuses)`, { openStatuses: ['unpaid', 'pending'] });
 
+    const grace = Math.max(0, Number(graceDays) || 0);
+
+    // `billingMonth` is the first day of the billing month, so each bucket maps to a contiguous
+    // range of months. Add a redundant, index-friendly range on `billingMonth` (widened by a small
+    // margin to absorb server/DB date skew) so the billingMonth index can be used; the DATEDIFF
+    // predicate below remains the authoritative bucket boundary.
+    const firstOfMonth = (daysAgo: number): string => {
+        const d = new Date();
+        d.setHours(0, 0, 0, 0);
+        d.setDate(d.getDate() - daysAgo);
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
+    };
+    const MARGIN = 2;
+    const rangeFrom = (daysAgo: number) => firstOfMonth(daysAgo + MARGIN);
+    const rangeTo = (daysAgo: number) => firstOfMonth(Math.max(0, daysAgo - MARGIN));
+
     const overdueExpr = `DATEDIFF(CURDATE(), DATE_ADD(LAST_DAY(${alias}.billingMonth), INTERVAL :graceDaysAge DAY))`;
-    qb.setParameter('graceDaysAge', Math.max(0, Number(graceDays) || 0));
+    qb.setParameter('graceDaysAge', grace);
 
     if (bucket === 'current') {
+        qb.andWhere(`${alias}.billingMonth >= :ageBucketFrom`, { ageBucketFrom: rangeFrom(grace) });
         qb.andWhere(`${overdueExpr} <= 0`);
         return;
     }
     if (bucket === '1_30') {
+        qb.andWhere(`${alias}.billingMonth >= :ageBucketFrom`, { ageBucketFrom: rangeFrom(grace + 30) });
+        qb.andWhere(`${alias}.billingMonth <= :ageBucketTo`, { ageBucketTo: rangeTo(grace + 1) });
         qb.andWhere(`${overdueExpr} BETWEEN 1 AND 30`);
         return;
     }
     if (bucket === '31_60') {
+        qb.andWhere(`${alias}.billingMonth >= :ageBucketFrom`, { ageBucketFrom: rangeFrom(grace + 60) });
+        qb.andWhere(`${alias}.billingMonth <= :ageBucketTo`, { ageBucketTo: rangeTo(grace + 31) });
         qb.andWhere(`${overdueExpr} BETWEEN 31 AND 60`);
         return;
     }
     if (bucket === '61_90') {
+        qb.andWhere(`${alias}.billingMonth >= :ageBucketFrom`, { ageBucketFrom: rangeFrom(grace + 90) });
+        qb.andWhere(`${alias}.billingMonth <= :ageBucketTo`, { ageBucketTo: rangeTo(grace + 61) });
         qb.andWhere(`${overdueExpr} BETWEEN 61 AND 90`);
         return;
     }
+    qb.andWhere(`${alias}.billingMonth <= :ageBucketTo`, { ageBucketTo: rangeTo(grace + 91) });
     qb.andWhere(`${overdueExpr} >= 91`);
 }
 
@@ -1450,27 +1474,21 @@ export const getAllExternalInvoices = async (
         .clone()
         .andWhere("externalInvoice.voidedAt IS NULL");
 
-    const totalFinancialInvoices = await financialBaseQb.clone().getCount();
-
-    const totalPaid = await financialBaseQb
+    // Single conditional-aggregate query instead of 5 separate COUNT/SUM round trips.
+    const metricsRow = await financialBaseQb
         .clone()
-        .andWhere("externalInvoice.status = 'paid'")
-        .getCount();
-
-    const totalUnpaid = await financialBaseQb
-        .clone()
-        .andWhere("externalInvoice.status = 'unpaid'")
-        .getCount();
-
-    const totalPending = await financialBaseQb
-        .clone()
-        .andWhere("externalInvoice.status = 'pending'")
-        .getCount();
-
-    const totalAmount = await financialBaseQb
-        .clone()
-        .select("SUM(externalInvoice.amount)", "sum")
-        .getRawOne<{ sum: string }>();
+        .select("COUNT(*)", "totalInvoices")
+        .addSelect("SUM(CASE WHEN externalInvoice.status = 'paid' THEN 1 ELSE 0 END)", "totalPaid")
+        .addSelect("SUM(CASE WHEN externalInvoice.status = 'unpaid' THEN 1 ELSE 0 END)", "totalUnpaid")
+        .addSelect("SUM(CASE WHEN externalInvoice.status = 'pending' THEN 1 ELSE 0 END)", "totalPending")
+        .addSelect("SUM(externalInvoice.amount)", "totalAmount")
+        .getRawOne<{
+            totalInvoices: string;
+            totalPaid: string;
+            totalUnpaid: string;
+            totalPending: string;
+            totalAmount: string;
+        }>();
 
     return {
         data,
@@ -1478,11 +1496,11 @@ export const getAllExternalInvoices = async (
         page,
         totalPages: Math.ceil(total / limit),
         metrics: {
-            totalInvoices: totalFinancialInvoices,
-            totalPaid,
-            totalUnpaid,
-            totalPending,
-            totalAmount: parseFloat(totalAmount?.sum || "0"),
+            totalInvoices: Number(metricsRow?.totalInvoices ?? 0),
+            totalPaid: Number(metricsRow?.totalPaid ?? 0),
+            totalUnpaid: Number(metricsRow?.totalUnpaid ?? 0),
+            totalPending: Number(metricsRow?.totalPending ?? 0),
+            totalAmount: parseFloat(metricsRow?.totalAmount || "0"),
         },
     };
 };

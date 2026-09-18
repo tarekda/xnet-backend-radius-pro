@@ -3,7 +3,6 @@ import { AppDataSource } from "../db/config";
 import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import {
   normalizeAmountDigits,
-  normalizePaymentLookupKey,
   collectorNameMatchesInvoiceName,
   splitNameTokens,
   expandArabicSqlToken,
@@ -255,13 +254,6 @@ export async function matchReceiptWithInvoices(extracted: ExtractedReceiptData):
 }> {
   const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
   
-  // Base query for unpaid invoices
-  let qb = invoiceRepo
-    .createQueryBuilder("i")
-    .where("LOWER(i.status) IN (:...statuses)", { statuses: ["unpaid", "pending"] })
-    .andWhere("i.voidedAt IS NULL")
-    .andWhere("(i.documentType IS NULL OR i.documentType = :docType)", { docType: "invoice" });
-
   // 1. If candidate names were found, search for matching invoices
   let matchedCandidates: ExternalInvoice[] = [];
   if (extracted.candidateNames.length > 0) {

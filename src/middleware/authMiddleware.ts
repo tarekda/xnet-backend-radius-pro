@@ -125,9 +125,6 @@ export const authorizeRoles = (...allowedRoles: Array<'admin' | 'manager' | 'sup
 export const authorizePermissions = (...requiredPermissions: string[]) => {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      console.warn(
-        `authorizePermissions ${req.method} ${req.originalUrl} user=${JSON.stringify(req.user)} required=${JSON.stringify(requiredPermissions)}`
-      );
       if (!req.user?.username && !req.user?.id) {
         res.status(401).send('Unauthorized');
         return;
@@ -183,7 +180,6 @@ export const authorizePermissions = (...requiredPermissions: string[]) => {
 export const authorizeAnyPermissions = (...anyPermissions: string[]) => {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      console.log(`authorizeAnyPermissions: ${JSON.stringify(req.user)}`);
       if (!req.user?.username && !req.user?.id) {
         res.status(401).send('Unauthorized');
         return;

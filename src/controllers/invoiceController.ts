@@ -35,7 +35,6 @@ import {
 } from "../services/externalInvoiceImportParser";
 import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import { invoiceEvents } from "../events/invoiceEvents";
-import eventBus from "../bus/eventBusSingleton";
 import { AppDataSource } from "../db/config";
 import { writeAuditLog } from "../audit/writeAuditLog";
 import { Invoices } from "../db/entities/Invoices";
@@ -58,6 +57,7 @@ import {
 } from "../services/providerMacService";
 import { UserController } from "./userController";
 import { radiusAuthCacheService } from "../services/radiusAuthCacheService";
+import { sendExternalInvoiceEmail } from "../services/invoiceEmailService";
 import {
   preserveUserDefaultProfile,
   restoreSubscriberLine,
@@ -564,7 +564,7 @@ export const payInvoiceHandler = async (req: Request, res: Response) => {
     sendResponse(res, true, 200, "Invoice paid successfully", invoice);
 
     // Fire-and-forget WhatsApp notification (does not block response)
-    ;(async () => {
+    (async () => {
       try {
         const repo = AppDataSource.getRepository(Invoices);
         const inv = await repo.findOne({
@@ -1376,7 +1376,7 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
     if (isPartial) return;
 
     // Fire-and-forget WhatsApp notification
-    ;(async () => {
+    (async () => {
       try {
         const phone = await resolveExternalInvoicePhone(invoice);
         if (!phone) {
@@ -1437,6 +1437,72 @@ export const unpayExternalInvoiceHandler = async (req: Request, res: Response) =
     sendResponse(res, true, 200, "Invoice marked as unpaid", invoice);
   } catch (error) {
     return sendCaughtError(res, error, "Failed to unpay invoice");
+  }
+};
+
+/** Printable-invoice link used in emails when the caller does not supply one. */
+const buildDefaultInvoicePrintUrl = (invoiceId: number): string | null => {
+  const base = String(process.env.PUBLIC_APP_URL || process.env.FRONTEND_URL || "")
+    .trim()
+    .replace(/\/+$/, "");
+  return base ? `${base}/external-invoices/${invoiceId}/print` : null;
+};
+
+/** Emails an external invoice (or credit note) to the subscriber. */
+export const emailExternalInvoiceHandler = async (req: Request, res: Response) => {
+  try {
+    const invoiceId = parseInt(req.params.invoiceId, 10);
+    if (!Number.isFinite(invoiceId)) {
+      return sendResponse(res, false, 400, "Invalid invoice ID");
+    }
+
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const invoice = await repo.findOne({ where: { id: invoiceId } });
+    if (!invoice) {
+      return sendResponse(res, false, 404, "External invoice not found");
+    }
+    if (invoice.voidedAt) {
+      return sendResponse(res, false, 400, "Voided documents cannot be emailed");
+    }
+
+    const body = (req.body ?? {}) as { to?: unknown; note?: unknown; printUrl?: unknown };
+
+    const result = await sendExternalInvoiceEmail(invoice, {
+      overrideTo: typeof body.to === "string" ? body.to : null,
+      note: typeof body.note === "string" ? body.note : null,
+      printUrl:
+        typeof body.printUrl === "string" && body.printUrl.trim()
+          ? body.printUrl.trim()
+          : buildDefaultInvoicePrintUrl(invoiceId),
+    });
+
+    if (!result.sent) {
+      return sendResponse(res, false, 400, result.reason);
+    }
+
+    // Best-effort bookkeeping — a logging failure must not fail the send.
+    try {
+      await repo.update(
+        { id: invoiceId },
+        {
+          lastAction: `emailed to ${result.to.join(", ")} by ${req.user?.username || "system"} @ ${new Date().toISOString()}`,
+        }
+      );
+    } catch {}
+    try {
+      await invoiceEvents.emitModification({
+        invoiceId,
+        username: req.user?.username || "system",
+        action: "UPDATED",
+        timestamp: new Date(),
+        changes: { emailedTo: result.to.join(", ") },
+      });
+    } catch {}
+
+    return sendResponse(res, true, 200, "Invoice emailed", { ok: true, ...result });
+  } catch (error: any) {
+    console.error("Error emailing external invoice:", error);
+    return sendResponse(res, false, 500, error?.message || "Failed to email invoice");
   }
 };
 

@@ -19,7 +19,6 @@ const jwtSecret = getJwtSecret();
 const refreshTokenSecret = getRefreshTokenSecret();
 /** Refresh tokens expire; rotation on /refresh-token issues a new one. */
 const REFRESH_TOKEN_EXPIRES_IN = process.env.REFRESH_TOKEN_EXPIRES_IN || '30d';
-const ACCESS_TOKEN_EXPIRES_IN = process.env.ACCESS_TOKEN_EXPIRES_IN || '1d';
 
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
     res.status(status).json({ success, message, data });
@@ -334,7 +333,6 @@ export const adminResetUserPassword = async (req: Request, res: Response) => {
 export const login = async (req: Request, res: Response) => {
     const { username, password } = req.body;
     const userRepository = AppDataSource.getRepository(SystemUsers);
-    const refreshTokenRepository = AppDataSource.getRepository(RefreshTokens);
 
     try {
 

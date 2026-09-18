@@ -1,5 +1,4 @@
 import { radiusAuthCacheService } from "../radiusAuthCacheService";
-import { redisClient } from "../../redisClient";
 
 const mockStore: Record<string, string> = {};
 

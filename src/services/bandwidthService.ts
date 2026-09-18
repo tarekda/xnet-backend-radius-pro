@@ -619,7 +619,7 @@ export class BandwidthService {
   /* ------------------------------------------------------------------
    * Historical traffic (simple: current snapshot)
    * ------------------------------------------------------------------*/
-  async getHistoricalTraffic(interfaceName: string, duration: number = 3600): Promise<BandwidthData[]> {
+  async getHistoricalTraffic(interfaceName: string, _duration: number = 3600): Promise<BandwidthData[]> {
     // In a real implementation we would query stored historical data.
     // For now we just return the current snapshot for the requested interface.
     const interfaces = await this.getInterfaceTraffic();

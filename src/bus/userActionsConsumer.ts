@@ -2,35 +2,15 @@
 import amqp, { Channel, ConsumeMessage } from "amqplib";
 import { AppDataSource } from "../db/config";
 import { UserController } from "../controllers/userController";
+import {
+  openUserActionsChannel,
+  USER_ACTIONS_DLQ as DLQ,
+  USER_ACTIONS_QUEUE as QUEUE,
+} from "./userActionsTopology";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const QUEUE = "user_actions_queue";
-const DLQ = "user_actions_dlq";
-const DLX = "user_actions.dlx";
-const DLQ_ROUTING_KEY = "user_actions.dlq";
 const MAX_RETRIES = Number(process.env.USER_ACTIONS_MAX_RETRIES || 3);
-
-async function setupQueues(channel: Channel) {
-  await channel.assertExchange(DLX, "direct", { durable: true });
-  await channel.assertQueue(DLQ, { durable: true });
-  await channel.bindQueue(DLQ, DLX, DLQ_ROUTING_KEY);
-  try {
-    await channel.assertQueue(QUEUE, {
-      durable: true,
-      deadLetterExchange: DLX,
-      deadLetterRoutingKey: DLQ_ROUTING_KEY,
-    });
-  } catch (err) {
-    // Existing queue may lack DLX args (PRECONDITION_FAILED). Keep consuming;
-    // publishRetry still writes to DLQ manually after max retries.
-    console.warn(
-      `user_actions queue assert with DLX failed — falling back to plain durable queue:`,
-      err instanceof Error ? err.message : err
-    );
-    await channel.assertQueue(QUEUE, { durable: true });
-  }
-}
 
 function retryCount(msg: ConsumeMessage): number {
   const header = msg.properties.headers?.["x-retry"];
@@ -69,8 +49,11 @@ async function publishRetry(channel: Channel, msg: ConsumeMessage, err: unknown)
 export async function startConsumer() {
   const rabbitMqUrl = process.env.RABBITMQ_URL || "amqp://127.0.0.1:5672";
   const connection = await amqp.connect(rabbitMqUrl);
-  const channel = await connection.createChannel();
-  await setupQueues(channel);
+  connection.on("error", (err) => {
+    console.error("user_actions connection error:", err);
+  });
+
+  const channel = await openUserActionsChannel(connection);
   await channel.prefetch(1);
   console.log(`Waiting for messages in ${QUEUE} (DLQ=${DLQ}, maxRetries=${MAX_RETRIES})...`);
 

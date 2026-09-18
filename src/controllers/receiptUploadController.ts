@@ -1,5 +1,4 @@
 import { Request, RequestHandler } from "express";
-import fs from "fs";
 import path from "path";
 import {
   performOcrOnImage,

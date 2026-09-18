@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { authenticateToken, authorizeAnyPermissions } from "../middleware/authMiddleware";
+import { authenticateToken } from "../middleware/authMiddleware";
 import {
   companyWalletBalance,
   companyWalletCredit,

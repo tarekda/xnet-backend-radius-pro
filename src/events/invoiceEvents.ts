@@ -1,6 +1,5 @@
 import { EventEmitter } from 'events';
 import eventBus from '../bus/eventBusSingleton';
-import { ExternalInvoice } from '../db/entities/ExternalInvoice';
 
 export interface InvoiceModification {
     invoiceId: number;

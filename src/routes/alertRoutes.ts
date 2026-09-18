@@ -9,6 +9,7 @@ import {
   resolveAlert,
   getAlertSettings,
   updateAlertSettings,
+  getAlertChannelConfig,
   testAlert,
   testWebhookEndpoint,
 } from '../controllers/alertController';
@@ -38,6 +39,9 @@ router.post('/:id/resolve', asyncHandler(resolveAlert));
 // Alert Settings routes
 router.get('/settings', asyncHandler(getAlertSettings));
 router.put('/settings', asyncHandler(updateAlertSettings));
+
+// Outbound channel configuration status (email / SMS)
+router.get('/channels', asyncHandler(getAlertChannelConfig));
 
 // Test route (for development)
 router.post('/test', asyncHandler(testAlert));

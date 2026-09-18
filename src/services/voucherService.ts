@@ -2,7 +2,6 @@ import { randomBytes } from "crypto";
 import { redisClient } from "../redisClient";
 import { AppDataSource } from "../db/config";
 import { Raduserprofile } from "../db/entities/Raduserprofile";
-import { Radprofile } from "../db/entities/Radprofile";
 import { radiusAuthCacheService } from "./radiusAuthCacheService";
 
 export interface VoucherCard {

@@ -91,7 +91,7 @@ async function maybeEnhanceBriefSummary(base: {
 export async function buildDailyOpsBrief(scope?: BriefScope): Promise<DailyOpsBriefResult> {
   const now = new Date();
   const start24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
+  const { staleCutoff } = readOnlineSessionConfig();
   const rs = resellerClause('up', scope);
   const rsInv = scope?.isReseller && scope.resellerId ? ' AND ei.username IN (SELECT username FROM raduserprofile WHERE owner_reseller_id = ?)' : '';
   const invParams = scope?.isReseller && scope.resellerId ? [scope.resellerId] : [];

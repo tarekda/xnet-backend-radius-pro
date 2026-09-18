@@ -1,6 +1,5 @@
 import axios, {
   AxiosInstance,
-  AxiosRequestConfig,
   AxiosResponse,
   isAxiosError,
 } from 'axios';
@@ -239,119 +238,6 @@ export function mapMyISPProviderMacRows(rows: unknown[]): Map<string, string> {
   return result;
 }
 
-async function fetchProviderMacMap(
-  client: AxiosInstance,
-  jar: CookieJar,
-  config: MyISPConfig,
-  usersHtml: string
-): Promise<Map<string, string>> {
-  const result = new Map<string, string>();
-  const csrfToken = extractPageCsrfToken(usersHtml);
-  if (!csrfToken) return result;
-
-  const pageSize = 500;
-  for (let start = 0; start < 100_000; start += pageSize) {
-    const response = await requestWithCookies(client, jar, {
-      method: "post",
-      url: "/admingetresellerusers.php",
-      data: dataTableForm(start, pageSize).toString(),
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-        "X-CSRF-Token": csrfToken,
-        Origin: new URL(config.baseUrl).origin,
-        Referer: `${config.baseUrl}/resellerUsers.php`,
-      },
-    });
-    if (response.status < 200 || response.status >= 300) break;
-
-    let payload: any;
-    try {
-      payload =
-        typeof response.data === "string" ? JSON.parse(response.data) : response.data;
-    } catch {
-      break;
-    }
-    if (payload?.redirect || payload?.error) break;
-
-    const rows = dataTableRows(payload);
-    for (const [username, mac] of mapMyISPProviderMacRows(rows)) {
-      result.set(username, mac);
-    }
-
-    const total = Number(payload?.recordsFiltered ?? payload?.recordsTotal);
-    if (rows.length === 0 || rows.length < pageSize) break;
-    if (Number.isFinite(total) && start + rows.length >= total) break;
-  }
-  return result;
-}
-
-async function requestWithCookies(
-  client: AxiosInstance,
-  jar: CookieJar,
-  config: AxiosRequestConfig,
-  redirectsRemaining = 5
-): Promise<AxiosResponse> {
-  const headers = { ...(config.headers || {}) } as Record<string, string>;
-  const cookie = jar.header();
-  if (cookie) headers.Cookie = cookie;
-
-  const response = await client.request({
-    ...config,
-    headers,
-    maxRedirects: 0,
-    validateStatus: () => true,
-  });
-  jar.update(response.headers['set-cookie']);
-
-  if (
-    response.status >= 300 &&
-    response.status < 400 &&
-    response.headers.location &&
-    redirectsRemaining > 0
-  ) {
-    const currentUrl = new URL(
-      String(response.config.url || ''),
-      String(client.defaults.baseURL)
-    );
-    const redirectedUrl = new URL(
-      response.headers.location,
-      currentUrl
-    ).toString();
-    const switchToGet =
-      response.status === 303 ||
-      ((response.status === 301 || response.status === 302) &&
-        String(config.method || 'get').toLowerCase() === 'post');
-    let redirectHeaders = config.headers;
-    if (switchToGet && redirectHeaders) {
-      redirectHeaders = { ...redirectHeaders };
-      delete redirectHeaders['Content-Type'];
-      delete redirectHeaders['content-type'];
-      delete redirectHeaders['Content-Length'];
-      delete redirectHeaders['content-length'];
-      delete redirectHeaders['Origin'];
-      delete redirectHeaders['origin'];
-      delete redirectHeaders['X-Requested-With'];
-      delete redirectHeaders['x-requested-with'];
-    }
-
-    return requestWithCookies(
-      client,
-      jar,
-      {
-        ...config,
-        url: redirectedUrl,
-        method: switchToGet ? 'get' : config.method,
-        data: switchToGet ? undefined : config.data,
-        headers: redirectHeaders,
-      },
-      redirectsRemaining - 1
-    );
-  }
-
-  return response;
-}
-
 function assertSuccessful(response: AxiosResponse, operation: string): void {
   if (response.status < 200 || response.status >= 400) {
     throw new AppError(
@@ -361,25 +247,6 @@ function assertSuccessful(response: AxiosResponse, operation: string): void {
       true
     );
   }
-}
-
-/** Fast path: login → CSV only, no MAC address pagination loop. */
-async function fetchMyISPCsvFast(account: MyISPAccount): Promise<Buffer> {
-  const { client, cookieStr, resellerId } = await fetchMyISPSession(account);
-
-  const exportResponse = await client.get('/export-users.php', {
-    params: { resellerId },
-    headers: { 'Cookie': cookieStr },
-    responseType: 'arraybuffer',
-    maxRedirects: 0,
-    validateStatus: () => true,
-  });
-  assertSuccessful(exportResponse, 'export');
-  const contentType = String(exportResponse.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-  if (contentType !== 'text/csv') {
-    throw new AppError('MyISP returned an unexpected export format', 502, 'MYISP_INVALID_EXPORT', true);
-  }
-  return Buffer.from(exportResponse.data);
 }
 
 /**

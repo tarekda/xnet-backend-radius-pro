@@ -6,6 +6,7 @@ import {
   voidCreditNote,
   getPaymentProviderStatus,
   handlePaymentWebhook,
+  isStubProviderEnabled,
   parseWhishCallbackPayload,
   signWebhookPayload,
   verifyProviderWebhookAuth,
@@ -159,7 +160,7 @@ router.post(
 
       // Fire-and-forget: notify subscriber that wallet was credited
       if (result.walletCredited) {
-        ;(async () => {
+        (async () => {
           try {
             const claim = result.claim;
             let phone = String(result.invoice?.phoneNumber || "").trim();
@@ -360,20 +361,28 @@ paymentWebhookRoutes.get("/whish/callback", async (req: Request, res: Response) 
   }
 });
 
-/** Dev helper: GET simulate marks stub intent succeeded (signed internally). */
-paymentWebhookRoutes.get("/stub/simulate", async (req: Request, res: Response) => {
-  try {
-    const gatewayIntentId = String(req.query.intent || "");
-    const payload = { gatewayIntentId, status: "succeeded" };
-    const body = JSON.stringify(payload);
-    const intent = await handlePaymentWebhook("stub", payload);
-    res.status(200).send(
-      `<html><body><h1>Payment simulated</h1><p>Intent ${intent.gatewayIntentId} → ${intent.status}</p>` +
-        `<p>Signature (for POST): ${signWebhookPayload(body)}</p></body></html>`
-    );
-  } catch (e: any) {
-    res.status(400).send(String(e?.message || "simulate failed"));
-  }
-});
+/**
+ * Dev helper: GET simulate marks a stub intent succeeded (signed internally).
+ *
+ * Registered only outside production. In production this was an unauthenticated
+ * way to settle any payment intent — and it echoes a valid signature for the
+ * body, so it also served as a signing oracle for the POST route.
+ */
+if (isStubProviderEnabled()) {
+  paymentWebhookRoutes.get("/stub/simulate", async (req: Request, res: Response) => {
+    try {
+      const gatewayIntentId = String(req.query.intent || "");
+      const payload = { gatewayIntentId, status: "succeeded" };
+      const body = JSON.stringify(payload);
+      const intent = await handlePaymentWebhook("stub", payload);
+      res.status(200).send(
+        `<html><body><h1>Payment simulated</h1><p>Intent ${intent.gatewayIntentId} → ${intent.status}</p>` +
+          `<p>Signature (for POST): ${signWebhookPayload(body)}</p></body></html>`
+      );
+    } catch (e: any) {
+      res.status(400).send(String(e?.message || "simulate failed"));
+    }
+  });
+}
 
 export default router;

@@ -4,19 +4,12 @@ import path from "path";
 import axios from "axios";
 import { Request, RequestHandler } from "express";
 import twilio from "twilio";
-import {
-  isWhatsAppGroupAutoPayEnabled,
-  payExternalInvoiceFromWhatsAppGroupMessage,
-} from "../services/whatsappPaymentGroupService";
+import { isWhatsAppGroupAutoPayEnabled } from "../services/whatsappPaymentGroupService";
 import {
   logInboundWhatsAppMessage,
   updateInboundWhatsAppMessageResult,
 } from "../services/whatsappInboundMessageService";
-import {
-  performOcrOnImage,
-  parseReceiptOcrText,
-  matchReceiptWithInvoices,
-} from "../services/whatsappReceiptOcrService";
+import { performOcrOnImage, parseReceiptOcrText } from "../services/whatsappReceiptOcrService";
 import { processInboundAgentMessage } from "../services/whatsappAgentService";
 
 async function downloadAndProcessMedia(mediaUrl: string, messageSid: string): Promise<{ localUrl: string; rawOcrText: string; extracted: any } | null> {

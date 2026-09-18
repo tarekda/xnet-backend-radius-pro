@@ -10,7 +10,6 @@ import {
   formatAlertMessage,
   type AlertMetricType,
 } from "./alertMetrics";
-import { alertNotificationService } from "../services/alertNotificationService";
 import { alertChannelService } from "./alertChannelService";
 
 const EVAL_MIN_INTERVAL_MS = 20_000;

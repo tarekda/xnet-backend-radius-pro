@@ -1,55 +1,23 @@
 import * as amqp from 'amqplib';
-import axios from 'axios';
-
-interface ExtendedConnection extends amqp.Connection {
-  serverProperties: any;
-  expectSocketClose: boolean;
-  sentSinceLastCheck: boolean;
-  recvSinceLastCheck: boolean;
-  sendMessage: (content: Buffer) => void;
-}
+import { openUserActionsChannel, USER_ACTIONS_QUEUE } from './userActionsTopology';
 
 export class EventBus {
   private connection!: any;
   private channel: amqp.Channel | undefined;
-  private readonly queue = 'user_actions_queue';
+  private readonly queue = USER_ACTIONS_QUEUE;
   private readonly rabbitMqUrl = process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672';
-  private readonly managementUrl = process.env.RABBITMQ_MANAGEMENT_URL || 'http://localhost:15672';
-
-  private async deleteQueueViaManagementApi(): Promise<void> {
-    try {
-      const url = `${this.managementUrl}/api/queues/%2F/${this.queue}`;
-      await axios.delete(url, {
-        auth: {
-          username: 'guest',
-          password: 'guest'
-        }
-      });
-      // console.log('Successfully deleted queue via management API');
-    } catch (error: any) {
-      if (error.response?.status === 404) {
-        console.log('Queue does not exist in management API');
-      } else {
-        console.error('Error deleting queue via management API:', error.message);
-      }
-    }
-  }
 
   async connect(): Promise<void> {
     try {
-      // First try to delete the queue via management API
-      await this.deleteQueueViaManagementApi();
-
       console.log('Connecting to RabbitMQ at:', this.rabbitMqUrl);
       this.connection = await amqp.connect(this.rabbitMqUrl);
-      this.channel = await this.connection.createChannel();
-      
-      // Create the queue with our desired settings
-      await this.channel?.assertQueue(this.queue, { 
-        durable: true
+      this.connection.on('error', (err: unknown) => {
+        console.error('EventBus connection error:', err);
       });
-      
-      // console.log('Successfully connected to RabbitMQ and asserted queue:', this.queue);
+
+      // Shares the consumer's topology definition, so both sides declare the
+      // queue with identical arguments.
+      this.channel = await openUserActionsChannel(this.connection);
     } catch (error) {
       console.error('Error connecting to RabbitMQ:', error);
       throw error;

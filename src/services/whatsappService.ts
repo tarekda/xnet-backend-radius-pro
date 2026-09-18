@@ -796,20 +796,6 @@ async function sendViaCloudTemplate(params: {
 }
 
 
-function isTwilioOutsideWindowError(error: any): boolean {
-    try {
-        const code = error?.response?.data?.code;
-        const msg: string = error?.response?.data?.message || error?.message || "";
-        return (
-            code === 63018 || // Freeform messages not allowed outside 24h window
-            /outside\s+the\s+allowed\s+window/i.test(msg) ||
-            /freeform\s+messages?\s+.*not\s+allowed/i.test(msg)
-        );
-    } catch {
-        return false;
-    }
-}
-
 async function sendViaTwilioTemplate(opts: WhatsAppSendOptions): Promise<void> {
     const { to, message, templateVariables, templateKind } = opts;
     const accountSid = getTwilioAccountSid();

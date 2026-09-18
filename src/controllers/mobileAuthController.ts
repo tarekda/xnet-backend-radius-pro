@@ -5,36 +5,11 @@ import { Equal } from "typeorm";
 import { AppDataSource } from "../db/config";
 import { SystemUsers } from "../db/entities/SystemUsers";
 import { RefreshTokens } from "../db/entities/RefreshTokens";
-import { getEffectivePermissionsForUser } from "../access/permissionService";
 import { getJwtSecret, getRefreshTokenSecret } from "../config/requireSecrets";
 import { clearStaffLoginFailures, getStaffLoginLock, recordStaffLoginFailure } from "../auth/staffLoginLockout";
 
 const jwtSecret = getJwtSecret();
 const refreshTokenSecret = getRefreshTokenSecret();
-const REFRESH_TOKEN_EXPIRES_IN = process.env.REFRESH_TOKEN_EXPIRES_IN || "30d";
-const ACCESS_TOKEN_EXPIRES_IN = process.env.ACCESS_TOKEN_EXPIRES_IN || "1d";
-
-type MobileUser = {
-  id: number;
-  username: string;
-  role: SystemUsers["role"];
-  permissions: string[];
-};
-
-const toMobileUser = async (user: SystemUsers): Promise<MobileUser> => {
-  const permissions = await getEffectivePermissionsForUser({
-    userId: user.id,
-    username: user.username,
-    roleKey: user.role ?? undefined,
-  });
-
-  return {
-    id: user.id,
-    username: user.username,
-    role: user.role,
-    permissions,
-  };
-};
 
 /**
  * POST /api/auth/mobile/login
@@ -50,7 +25,6 @@ export const mobileLogin: RequestHandler = async (req, res) => {
   }
 
   const userRepository = AppDataSource.getRepository(SystemUsers);
-  const refreshTokenRepository = AppDataSource.getRepository(RefreshTokens);
 
   try {
     const lookup = username.trim().toLowerCase();

@@ -1,6 +1,9 @@
 import { AppDataSource } from "../../db/config";
 import { invoiceEvents } from "../../events/invoiceEvents";
+import { writeAuditLog } from "../../audit/writeAuditLog";
+import { payExternalInvoice } from "../invoiceService";
 import {
+  handlePaymentWebhook,
   parseWhishCallbackPayload,
   verifyProviderWebhookAuth,
   voidCreditNote,
@@ -10,6 +13,7 @@ jest.mock("../../db/config", () => ({ AppDataSource: { getRepository: jest.fn() 
 jest.mock("../../events/invoiceEvents", () => ({
   invoiceEvents: { emitModification: jest.fn() },
 }));
+jest.mock("../../audit/writeAuditLog", () => ({ writeAuditLog: jest.fn() }));
 jest.mock("../invoiceService", () => ({ payExternalInvoice: jest.fn() }));
 jest.mock("../whishGateway", () => ({
   isWhishConfigured: jest.fn(() => false),
@@ -74,6 +78,93 @@ describe("paymentGatewayService webhook helpers", () => {
         secretParam: "wrong",
       })
     ).toBe(false);
+  });
+});
+
+describe("handlePaymentWebhook provider binding", () => {
+  const mockedPay = payExternalInvoice as jest.MockedFunction<typeof payExternalInvoice>;
+  const prevNodeEnv = process.env.NODE_ENV;
+  const prevHmac = process.env.PAYMENT_WEBHOOK_SECRET;
+
+  const pendingIntent = (provider: string) => ({
+    id: 1,
+    externalInvoiceId: 5,
+    gatewayIntentId: provider === "whish" ? "whish_5_1700000000000" : "stub_5_1700000000000",
+    gatewayProvider: provider,
+    status: "pending",
+    amount: 10,
+    currency: "USD",
+  });
+
+  /** Minimal repository double for the claim-and-settle path. */
+  const wireRepo = (intent: Record<string, unknown>) => {
+    const execute = jest.fn().mockResolvedValue({ affected: 1 });
+    const findOne = jest.fn().mockResolvedValue(intent);
+    const save = jest.fn().mockResolvedValue(intent);
+    (AppDataSource.getRepository as jest.Mock).mockReturnValue({
+      findOne,
+      save,
+      createQueryBuilder: jest.fn(() => ({
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        execute,
+      })),
+    });
+    return { findOne, save };
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Jest runs with NODE_ENV=test, so the stub provider is available here.
+    process.env.NODE_ENV = "test";
+    process.env.PAYMENT_WEBHOOK_SECRET = "test-hmac";
+  });
+
+  afterAll(() => {
+    if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prevNodeEnv;
+    if (prevHmac === undefined) delete process.env.PAYMENT_WEBHOOK_SECRET;
+    else process.env.PAYMENT_WEBHOOK_SECRET = prevHmac;
+  });
+
+  it("refuses to settle a whish intent through the stub provider", async () => {
+    const intent = pendingIntent("whish");
+    wireRepo(intent);
+
+    await expect(
+      handlePaymentWebhook("stub", { gatewayIntentId: String(intent.gatewayIntentId), status: "succeeded" })
+    ).rejects.toThrow(/Provider mismatch/);
+
+    expect(mockedPay).not.toHaveBeenCalled();
+  });
+
+  it("refuses the stub provider in production, before any intent lookup", async () => {
+    process.env.NODE_ENV = "production";
+    const intent = pendingIntent("stub");
+    const { findOne } = wireRepo(intent);
+
+    await expect(
+      handlePaymentWebhook("stub", { gatewayIntentId: String(intent.gatewayIntentId), status: "succeeded" })
+    ).rejects.toThrow(/not available in production/);
+
+    expect(findOne).not.toHaveBeenCalled();
+    expect(mockedPay).not.toHaveBeenCalled();
+  });
+
+  it("settles an intent when the provider matches", async () => {
+    const intent = pendingIntent("whish");
+    wireRepo(intent);
+
+    const settled = await handlePaymentWebhook("whish", {
+      gatewayIntentId: String(intent.gatewayIntentId),
+      status: "succeeded",
+    });
+
+    expect(settled.status).toBe("succeeded");
+    expect(mockedPay).toHaveBeenCalledWith(5, "gateway", "gateway");
+    expect(writeAuditLog).toHaveBeenCalled();
   });
 });
 

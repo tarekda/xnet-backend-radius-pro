@@ -8,7 +8,7 @@ import { cleanupOldBackups, runDbBackup, runMikrotikBackup } from "../controller
  * - MIKROTIK_IP: default router IP for MikroTik backup
  * - BACKUP_RETENTION_DAYS: retention window (default 14)
  */
-export function startBackupScheduler(app: any) {
+export function startBackupScheduler(_app: any) {
   const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production";
   const configuredDbCron = String(process.env.BACKUP_DB_CRON ?? "").trim();
   const dbCron = configuredDbCron || (isProduction ? "0 2 * * *" : "");

@@ -27,16 +27,20 @@ describe("invoiceDue / remainingDue", () => {
 
 describe("resolvePaymentApply", () => {
   it("defaults to the remaining balance", () => {
-    expect(resolvePaymentApply(40, null)).toEqual({ apply: 40, partial: false });
-    expect(resolvePaymentApply(40, undefined)).toEqual({ apply: 40, partial: false });
+    expect(resolvePaymentApply(40, null)).toEqual({ apply: 40, partial: false, overpay: 0 });
+    expect(resolvePaymentApply(40, undefined)).toEqual({ apply: 40, partial: false, overpay: 0 });
   });
 
   it("applies a smaller requested amount as a partial", () => {
-    expect(resolvePaymentApply(40, 15)).toEqual({ apply: 15, partial: true });
+    expect(resolvePaymentApply(40, 15)).toEqual({ apply: 15, partial: true, overpay: 0 });
   });
 
-  it("rejects overpayment and non-positive amounts", () => {
-    expect(() => resolvePaymentApply(10, 10.02)).toThrow(/exceeds remaining due/);
+  it("records overpayment as overpay by default and rejects non-positive amounts", () => {
+    // Overpayment is accepted by default: only the remaining balance is applied,
+    // the excess is returned as `overpay`.
+    expect(resolvePaymentApply(10, 10.02)).toEqual({ apply: 10, partial: false, overpay: 0.02 });
+    // Callers may opt out to reject overpayment outright.
+    expect(() => resolvePaymentApply(10, 10.02, { allowOverpay: false })).toThrow(/exceeds remaining due/);
     expect(() => resolvePaymentApply(10, 0)).toThrow(/greater than 0/);
     expect(() => resolvePaymentApply(10, -1)).toThrow(/greater than 0/);
   });

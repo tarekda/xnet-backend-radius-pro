@@ -2,7 +2,6 @@
 import winston from 'winston';
 import expressWinston from 'express-winston';
 import { Request, Response, NextFunction } from 'express';
-import { getRepository } from 'typeorm';
 import { Logs } from '../db/entities/Logs'; // Adjust the path as needed
 import { TypeOrmTransport } from './TypeormTransport';
 import { AppDataSource } from '../db/config';

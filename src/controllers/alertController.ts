@@ -13,6 +13,7 @@ import {
   type AlertSettingsPayload,
 } from "../alerts/alertMetrics";
 import { evaluateAlertRulesIfStale } from "../alerts/evaluateAlertRules";
+import { alertChannelService } from "../alerts/alertChannelService";
 import { alertNotificationService } from "../services/alertNotificationService";
 
 function serializeRule(rule: AlertRule) {
@@ -382,6 +383,20 @@ export const testAlert = async (req: Request, res: Response) => {
   } catch (error) {
     console.error("Error creating test alert:", error);
     res.status(500).json({ success: false, message: "Failed to create test alert" });
+  }
+};
+
+/** Reports which outbound alert channels are configured, and why any are not. */
+export const getAlertChannelConfig = async (_req: Request, res: Response) => {
+  try {
+    res.json({
+      success: true,
+      data: alertChannelService.describeChannels(),
+      message: "Alert channel configuration retrieved",
+    });
+  } catch (error) {
+    console.error("Error reading alert channel configuration:", error);
+    res.status(500).json({ success: false, message: "Failed to read alert channel configuration" });
   }
 };
 

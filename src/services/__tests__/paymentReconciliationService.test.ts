@@ -103,7 +103,11 @@ describe("PaymentReconciliationService", () => {
   });
 
   it("should extend expiry by exactly 1 calendar month, not 30 days", async () => {
-    const baseExpiry = new Date("2026-03-15T00:00:00.000Z");
+    const now = new Date();
+    // 15th of the month, two months ahead — always in the future so the service
+    // extends from the stored expiry (baseDate = max(expiresAt, now)) rather than today.
+    const baseExpiry = new Date(now.getFullYear(), now.getMonth() + 2, 15, 0, 0, 0, 0);
+    const expected = new Date(now.getFullYear(), now.getMonth() + 3, 15, 0, 0, 0, 0);
     mockProfile = {
       username: "subscriber_paid",
       accountStatus: "suspended",
@@ -122,14 +126,15 @@ describe("PaymentReconciliationService", () => {
     await paymentReconciliationService.processPaymentWebhook(payload);
 
     const newExpiry = new Date(mockProfile.expiresAt);
-    // Exactly 1 calendar month later (Apr 15), NOT 30 days later (Apr 14)
-    expect(newExpiry.getMonth()).toBe(3); // April = 3 (0-indexed)
+    // Exactly 1 calendar month later, NOT 30 days later.
+    expect(newExpiry.getFullYear()).toBe(expected.getFullYear());
+    expect(newExpiry.getMonth()).toBe(expected.getMonth());
     expect(newExpiry.getDate()).toBe(15);
-    expect(newExpiry.getFullYear()).toBe(2026);
   });
 
-  it("should handle month-edge (Jan 31 + 1 month = Feb 28, not Mar 3)", async () => {
-    const baseExpiry = new Date("2026-01-31T00:00:00.000Z");
+  it("should handle month-edge (Jan 31 + 1 month = last day of Feb)", async () => {
+    const year = new Date().getFullYear() + 1;
+    const baseExpiry = new Date(year, 0, 31, 0, 0, 0, 0); // Jan 31 next year (always future)
     mockProfile = {
       username: "subscriber_paid",
       accountStatus: "expired",
@@ -148,8 +153,10 @@ describe("PaymentReconciliationService", () => {
     await paymentReconciliationService.processPaymentWebhook(payload);
 
     const newExpiry = new Date(mockProfile.expiresAt);
-    // Feb 2026 has 28 days; must NOT overshoot into March
-    expect(newExpiry.getMonth()).toBe(1); // February = 1
-    expect(newExpiry.getDate()).toBe(28);
+    // Feb has 28 or 29 days; must NOT overshoot into March.
+    const lastDayOfFeb = new Date(year, 2, 0).getDate();
+    expect(newExpiry.getFullYear()).toBe(year);
+    expect(newExpiry.getMonth()).toBe(1); // February
+    expect(newExpiry.getDate()).toBe(lastDayOfFeb);
   });
 });

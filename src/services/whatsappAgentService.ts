@@ -11,7 +11,7 @@ import {
   extractPaymentLinesFromMessage,
   WhatsAppGroupPayResult,
 } from "./whatsappPaymentGroupService";
-import { parseReceiptOcrText, performOcrOnImage } from "./whatsappReceiptOcrService";
+import { parseReceiptOcrText } from "./whatsappReceiptOcrService";
 import {
   getTopupPlans,
   purchaseTopupPack,
@@ -594,7 +594,7 @@ export function buildBatchPaymentReply(payResult: WhatsAppGroupPayResult): strin
     return `❌ *Payment Processing Error*\n${payResult.detail || "An unexpected error occurred while processing payments."}`;
   }
 
-  const { results, paidInvoiceIds } = payResult;
+  const { results } = payResult;
   const paidCount = results.filter((r) => r.status === "paid").length;
   const ambiguousCount = results.filter((r) => r.status === "ambiguous").length;
   const noMatchCount = results.filter((r) => r.status === "no_match").length;
@@ -702,17 +702,15 @@ export async function handleReceiptSubmission(
   if (paidIds.length > 0) {
     // Automatically trigger Step 1 closed-loop self-healing line restoration
     const username = sub?.username || (firstRes && firstRes.name ? firstRes.name : null);
-    let disconnected = false;
     let newExpiry: Date | null = null;
 
     if (username) {
       try {
-        const healResult = await restoreSubscriberLine(username, {
+        await restoreSubscriberLine(username, {
           trigger: "gateway_payment",
           actor: "whatsapp:agent",
           invoiceId: paidIds[0],
         });
-        disconnected = Boolean(healResult.disconnected);
         const rupRepo = AppDataSource.getRepository(Raduserprofile);
         const updated = await rupRepo.findOne({ where: { username } });
         newExpiry = updated?.expiresAt ? new Date(updated.expiresAt) : null;

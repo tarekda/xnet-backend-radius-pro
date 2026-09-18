@@ -5,30 +5,13 @@
  * instead of invoice data.
  */
 import type { ExternalUser, ExternalUserProvider } from "./externalUsersService";
-import { parseMyISPCsv, type MyISPAccount } from "./myispInvoiceService";
-import { parseHsiWorkbook, type HsiProvider } from "./hsiProviderInvoiceService";
+import type { MyISPAccount } from "./myispInvoiceService";
+import type { HsiProvider } from "./hsiProviderInvoiceService";
 
 // Re-export the internal fetchAuthenticatedExport functions by calling the
 // existing invoice service fetch but grabbing only the raw export buffer.
 
 // ─── MyISP ────────────────────────────────────────────────────────────────────
-
-function normalizeCell(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  return String(value).trim();
-}
-
-function normalizeHeader(header: string): string {
-  return header.replace(/^\uFEFF/, "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
-
-function readField(row: Record<string, unknown>, keys: string[]): unknown {
-  const wanted = new Set(keys.map(normalizeHeader));
-  for (const [header, value] of Object.entries(row)) {
-    if (wanted.has(normalizeHeader(header))) return value;
-  }
-  return undefined;
-}
 
 export async function fetchAuthenticatedMyISPRows(account: MyISPAccount): Promise<ExternalUser[]> {
   // Use the fast path: login → DataTable API with live online status embedded in HTML.

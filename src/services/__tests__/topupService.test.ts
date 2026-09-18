@@ -3,7 +3,6 @@ import {
   getSubscriberActiveTopupBytes,
   getSubscriberWalletBalance,
   purchaseTopupPack,
-  DEFAULT_TOPUP_PLANS,
 } from "../topupService";
 import { AppDataSource } from "../../db/config";
 import { TopupPlan } from "../../db/entities/TopupPlan";

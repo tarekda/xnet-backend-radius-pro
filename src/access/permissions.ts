@@ -12,6 +12,7 @@ export const PERMISSIONS = [
   "ui.sidebar.billing.collections.show",
   "ui.sidebar.cablevision.show",
   "ui.sidebar.admin.analytics.show",
+  "ui.sidebar.admin.reports.show",
   "ui.sidebar.admin.alerts.show",
   "ui.sidebar.admin.expenses.show",
   "ui.sidebar.admin.authUsers.show",
@@ -19,9 +20,12 @@ export const PERMISSIONS = [
   "ui.sidebar.admin.backups.show",
   "ui.sidebar.admin.resellers.show",
   "ui.sidebar.admin.companyWallet.show",
+  "ui.sidebar.support.tickets.show",
 
   // Admin section
   "admin.analytics.view",
+  "admin.reports.view",
+  "admin.reports.manage",
   "admin.alerts.view",
   "admin.expenses.view",
   "admin.authUsers.manage",
@@ -47,6 +51,7 @@ export const PERMISSIONS = [
   "billing.externalInvoices.pay",
   "billing.externalInvoices.unpay",
   "billing.externalInvoices.dunning",
+  "billing.invoices.pay",
   "billing.collections.view",
   "billing.companyWallet.view",
   "billing.companyWallet.manage",
@@ -62,6 +67,10 @@ export const PERMISSIONS = [
   // Dashboard widgets
   "dashboard.widget.totalAmount",
   "dashboard.widget.invoiceCounts",
+
+  // Support / ticketing
+  "support.tickets.view",
+  "support.tickets.manage",
 
   // Reseller portal
   "reseller.portal.access",

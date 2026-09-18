@@ -1,13 +1,12 @@
 import { Request, Response } from "express";
 import { SessionTracking } from "../db/entities/SessionTracking";
-import { Brackets, Repository } from "typeorm";
+import { Brackets } from "typeorm";
 import { AppDataSource } from "../db/config";
 import { Radusagestats } from "../db/entities/Radusagestats";
 import { Raduserprofile } from "../db/entities/Raduserprofile";
 import { Radprofile } from "../db/entities/Radprofile";
 import { UserDetails } from "../db/entities/UserDetails";
 import { getOnlineUsers } from "../repo/onlineUsers";
-import eventBus from "../bus/eventBusSingleton";
 import { ConnectionLogs } from "../db/entities/ConnectionLogs";
 import { Radacct } from "../db/entities/Radacct";
 import { Nas } from "../db/entities/Nas";

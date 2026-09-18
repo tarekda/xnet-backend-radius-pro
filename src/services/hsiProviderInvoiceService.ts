@@ -339,9 +339,6 @@ async function terraFetchAllUsers(config: HsiConfig, token: string): Promise<Ter
 
 async function terraFetchExportWorkbook(config: HsiConfig, token: string): Promise<Buffer | null> {
   try {
-    const https = require('https');
-    const agent = new https.Agent({ keepAlive: false });
-
     const resp = await axios.get(`${config.baseUrl}/api/user/list/download`, {
       headers: {
         Authorization: `Bearer ${token}`,

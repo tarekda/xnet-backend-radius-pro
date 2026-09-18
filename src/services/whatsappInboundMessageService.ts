@@ -69,7 +69,6 @@ export async function updateInboundWhatsAppMessageResult(
 
   let status: WhatsappInboundMessage["status"] = "processed";
   let extractedAmount: number | null = null;
-  let overpaymentAmount: number | null = null;
   let errorDetail: string | null = null;
 
   if (resList.length > 0) {

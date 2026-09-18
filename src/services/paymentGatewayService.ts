@@ -19,11 +19,23 @@ function isProduction(): boolean {
   return String(process.env.NODE_ENV || "").toLowerCase() === "production";
 }
 
-function webhookSecret(): string {
+/**
+ * The HMAC key used to sign and verify payment webhooks, or null when none is
+ * configured. Production must set PAYMENT_WEBHOOK_SECRET: falling back to a
+ * default there would make every signature publicly computable.
+ */
+function webhookSecret(): string | null {
   const dedicated = String(process.env.PAYMENT_WEBHOOK_SECRET || "").trim();
   if (dedicated) return dedicated;
-  if (isProduction()) return "";
-  return "dev-webhook-secret";
+  return isProduction() ? null : "dev-webhook-secret";
+}
+
+/**
+ * The stub provider fabricates payments instead of collecting them, so it is
+ * only ever available outside production, whatever PAYMENT_PROVIDER says.
+ */
+export function isStubProviderEnabled(): boolean {
+  return !isProduction();
 }
 
 function publicApiBase(): string {
@@ -196,12 +208,16 @@ export async function createPaymentIntent(externalInvoiceId: number) {
 }
 
 export function signWebhookPayload(body: string): string {
-  return crypto.createHmac("sha256", webhookSecret()).update(body).digest("hex");
+  const secret = webhookSecret();
+  if (!secret) return "";
+  return crypto.createHmac("sha256", secret).update(body).digest("hex");
 }
 
 export function verifyWebhookSignature(body: string, signature: string | undefined): boolean {
   if (!signature) return false;
   const expected = signWebhookPayload(body);
+  // No configured secret means nothing can be verified, so fail closed.
+  if (!expected) return false;
   try {
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
   } catch {
@@ -245,6 +261,9 @@ export async function handlePaymentWebhook(
   if (normalizedProvider !== "stub" && normalizedProvider !== "whish") {
     throw new Error(`Unsupported payment provider: ${provider}`);
   }
+  if (normalizedProvider === "stub" && !isStubProviderEnabled()) {
+    throw new Error("Stub payment provider is not available in production");
+  }
 
   const gatewayIntentId = String(payload.gatewayIntentId || "").trim();
   if (!gatewayIntentId) throw new Error("Missing gatewayIntentId / order_id");
@@ -254,11 +273,9 @@ export async function handlePaymentWebhook(
     where: { gatewayIntentId: Equal(gatewayIntentId) },
   });
   if (!intent) throw new Error("Payment intent not found");
-  if (intent.gatewayProvider !== normalizedProvider && normalizedProvider !== "stub") {
-    // Allow stub simulate only for stub intents; whish callbacks must match provider
-    if (intent.gatewayProvider !== "whish" || normalizedProvider !== "whish") {
-      throw new Error(`Provider mismatch for intent ${gatewayIntentId}`);
-    }
+  // The intent may only ever be settled through the gateway that created it.
+  if (intent.gatewayProvider !== normalizedProvider) {
+    throw new Error(`Provider mismatch for intent ${gatewayIntentId}`);
   }
   if (intent.status === "succeeded") return intent;
 

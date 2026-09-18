@@ -1,6 +1,6 @@
 // src/routes/invoice.routes.ts
 import { Router } from "express";
-import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceByIdHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, getProviderMacListHandler, getProviderMacOptionsHandler, syncProviderMacAddressesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, sharePaidExternalInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, getWhatsAppDiagnosticsHandler, getSubscriberDunningEnforcementHandler, restoreSubscriberLineHandler, previewMyISPInvoicesHandler, importMyISPInvoicesHandler, previewMyISP2InvoicesHandler, importMyISP2InvoicesHandler, previewRadiusInvoicesHandler, importRadiusInvoicesHandler, previewIDMInvoicesHandler, importIDMInvoicesHandler, previewTerraInvoicesHandler, importTerraInvoicesHandler, previewTerra2InvoicesHandler, importTerra2InvoicesHandler, previewMispInvoicesHandler, importMispInvoicesHandler } from "../controllers/invoiceController";
+import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, bulkUpdateExternalInvoicesHandler, createExternalInvoiceDebitHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoiceByIdHandler, getExternalInvoiceHistoryHandler, getExternalInvoicePaymentLinesHandler, getExternalInvoicesAgingSummaryHandler, getExternalInvoicesHandler, getExternalInvoicesPaymentDueHandler, getExternalInvoicesTrendHandler, getInvoicesHandler, getProviderMacListHandler, getProviderMacOptionsHandler, syncProviderMacAddressesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, setExternalInvoiceWorkflowHandler, sharePaidExternalInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, previewExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler, emailExternalInvoiceHandler, getWhatsAppDiagnosticsHandler, getSubscriberDunningEnforcementHandler, restoreSubscriberLineHandler, previewMyISPInvoicesHandler, importMyISPInvoicesHandler, previewMyISP2InvoicesHandler, importMyISP2InvoicesHandler, previewRadiusInvoicesHandler, importRadiusInvoicesHandler, previewIDMInvoicesHandler, importIDMInvoicesHandler, previewTerraInvoicesHandler, importTerraInvoicesHandler, previewTerra2InvoicesHandler, importTerra2InvoicesHandler, previewMispInvoicesHandler, importMispInvoicesHandler } from "../controllers/invoiceController";
 import {
   dismissWhatsappPaymentAmbiguityHandler,
   listWhatsappPaymentAmbiguitiesHandler,
@@ -85,13 +85,15 @@ router.get(
   getInvoicesHandler
 );
 // Add route for paying a single invoice
-router.post("/pay/:invoiceId", authenticateToken, authorizeRoles('admin','manager','support','collector'), payInvoiceHandler);
-router.post("/collect/:invoiceId", authenticateToken, authorizeRoles('collector','manager','admin'), collectInvoiceHandler);
+// Settling money needs both the role and the explicit permission, so a deny
+// override on a single user is honoured.
+router.post("/pay/:invoiceId", authenticateToken, authorizeRoles('admin','manager','support','collector'), authorizePermissions('billing.invoices.pay'), payInvoiceHandler);
+router.post("/collect/:invoiceId", authenticateToken, authorizeRoles('collector','manager','admin'), authorizePermissions('billing.invoices.pay'), collectInvoiceHandler);
 // IMPORTANT: define /reconcile/bulk before /reconcile/:invoiceId
-router.post("/reconcile/bulk", authenticateToken, authorizeRoles('collector','manager','admin'), reconcileBulkCashHandler);
-router.post("/reconcile/:invoiceId", authenticateToken, authorizeRoles('collector','manager','admin'), reconcileInvoiceCashHandler);
+router.post("/reconcile/bulk", authenticateToken, authorizeRoles('collector','manager','admin'), authorizePermissions('billing.invoices.pay'), reconcileBulkCashHandler);
+router.post("/reconcile/:invoiceId", authenticateToken, authorizeRoles('collector','manager','admin'), authorizePermissions('billing.invoices.pay'), reconcileInvoiceCashHandler);
 // Add route for bulk paying invoices
-router.post("/bulk-pay", authenticateToken, authorizeRoles('admin','manager'), bulkPayInvoicesHandler);
+router.post("/bulk-pay", authenticateToken, authorizeRoles('admin','manager'), authorizePermissions('billing.invoices.pay'), bulkPayInvoicesHandler);
 router.post("/upload/preview", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), upload.single("file"), previewExternalInvoiceFile);
 router.post("/upload", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), upload.single("file"), uploadExternalInvoiceFile);
 router.post("/myisp/preview", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), previewMyISPInvoicesHandler);
@@ -276,6 +278,17 @@ router.post(
     "billing.externalInvoices.unpay"
   ),
   remindExternalInvoiceHandler
+);
+router.post(
+  "/external/:invoiceId/email",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.viewTotals",
+    "billing.externalInvoices.pay",
+    "billing.externalInvoices.unpay"
+  ),
+  emailExternalInvoiceHandler
 );
 router.post(
   "/external/:invoiceId/share-paid",

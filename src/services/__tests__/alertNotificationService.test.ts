@@ -1,5 +1,5 @@
 import axios from "axios";
-import { AlertNotificationService, alertNotificationService } from "../alertNotificationService";
+import { AlertNotificationService } from "../alertNotificationService";
 import { AlertIncident } from "../../db/entities/AlertIncident";
 
 jest.mock("axios");

@@ -1,4 +1,4 @@
-import { Column, Entity, Index, JoinColumn, OneToOne } from "typeorm";
+import { Column, Entity, JoinColumn, OneToOne } from "typeorm";
 import { Radcheck } from "./Radcheck";
 
 // @Index("mac_address", ["macAddress"], { unique: true })

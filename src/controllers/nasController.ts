@@ -50,7 +50,6 @@ export const NasController = {
                 nasEntries = JSON.parse(cachedResponse);
             } else {
                 const nasRepository = AppDataSource.getRepository(Nas);
-                const totalEntries = await nasRepository.count();
 
                 nasEntries = await nasRepository.find({
                     skip: offset,

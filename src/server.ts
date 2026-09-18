@@ -4,9 +4,6 @@ import express from 'express';
 import compression from 'compression';
 import path from 'path';
 import axios from 'axios';
-import { randomUUID } from 'crypto';
-import radius from 'radius';
-import dgram from 'dgram';
 import swaggerJsDoc from 'swagger-jsdoc';
 import swaggerUi from 'swagger-ui-express';
 import authRoutes from './routes/authRoutes';
@@ -63,15 +60,20 @@ import { runWhishClaimReconciliationJob } from "./jobs/whishClaimReconciliationJ
 import { startDailyRevenueSnapshotScheduler } from "./jobs/dailyRevenueSnapshotJob";
 import { startMonthlyQuotaResetScheduler } from "./jobs/monthlyQuotaResetJob";
 import { startAlertEscalationScheduler, stopAlertEscalationScheduler } from "./jobs/alertEscalationJob";
+import { startReportScheduleScheduler, stopReportScheduleScheduler } from "./jobs/reportScheduleJob";
 import { startDunningEscalationScheduler, stopDunningEscalationScheduler } from "./jobs/dunningEscalationJob";
-import revenueLeakageRoutes from "./routes/revenueLeakageRoutes";
+import revenueLeakageRoutes from './routes/revenueLeakageRoutes';
+import reportRoutes from './routes/reportRoutes';
+import ticketRoutes from './routes/ticketRoutes';
+import pushRoutes from './routes/pushRoutes';
+import { startTicketSlaScheduler, stopTicketSlaScheduler } from './jobs/ticketSlaJob';
 import { startRevenueLeakageAuditScheduler, stopRevenueLeakageAuditScheduler } from "./jobs/revenueLeakageAuditJob";
 import { ipWhitelistMiddleware } from "./middleware/ipWhitelist";
 import { csrfProtectionMiddleware } from "./middleware/csrfProtection";
 import { requestIdMiddleware } from "./middleware/requestId";
 import { voucherService } from "./services/voucherService";
 import { clickhouseRollupService } from "./services/clickhouseRollupService";
-import { assertProductionSecrets, getJwtSecret, getRadiusSecret } from "./config/requireSecrets";
+import { assertProductionSecrets, getJwtSecret } from "./config/requireSecrets";
 import jwt from "jsonwebtoken";
 
 dotenv.config();
@@ -138,6 +140,12 @@ app.use(metricsMiddleware);
 // Store connected clients
 const clients = new Set();
 
+/**
+ * One broadcaster for all sockets: it polls the database once per interval and
+ * fans the payload out, rather than each connection polling on its own.
+ */
+const sessionWatcher = new SessionTrackingWatcher(() => clients as Iterable<any>);
+
 wss.on('connection', (ws: any, req: any) => {
     // Require a valid JWT before accepting the socket (query ?token= or Authorization header).
     try {
@@ -162,14 +170,6 @@ wss.on('connection', (ws: any, req: any) => {
     console.log('✅ WebSocket client connected');
     clients.add(ws);
     setWebsocketClients(clients.size);
-
-    // Start the watcher
-    const watcher = new SessionTrackingWatcher(ws);
-
-    if (!watcher.started) {
-        watcher.start();
-        watcher.started = true;
-    }
 
     // Clients may only receive broadcasts. Never accept client-originated
     // business events (e.g. INVOICE_PAID) — that was an unauthenticated injection path.
@@ -265,6 +265,9 @@ app.use("/api/external-users", externalUsersRoutes);
 app.use("/api/cable-vision", cableVisionRoutes);
 app.use('/api', aiRoutes);
 app.use('/api/revenue-leakage', revenueLeakageRoutes);
+app.use('/api/reports', reportRoutes);
+app.use('/api/tickets', ticketRoutes);
+app.use('/api/push', pushRoutes);
 
 const monthlyInvoiceTask = cron.schedule("0 0 1 * *", async () => {
     console.log("Running monthly invoice generation...");
@@ -295,63 +298,6 @@ if (dunningTask) {
 let expiryDisconnectTask: ReturnType<typeof cron.schedule> | null = null;
 let alertEvalTask: ReturnType<typeof cron.schedule> | null = null;
 let whishReconciliationTask: ReturnType<typeof cron.schedule> | null = null;
-
-// RADIUS server setup
-const radiusServer = dgram.createSocket('udp4');
-
-// Hardcoded user database
-const users: { [key: string]: string } = {
-    'testuser': 'password123'
-};
-
-//const client = new MongoClient(process.env.MONGO_URI || 'mongodb://localhost:27017');
-
-async function logSession(username: string, action: string): Promise<void> {
-    // try {
-    //     await client.connect();
-    //     const database = client.db('radius');
-    //     const sessions = database.collection('sessions');
-    //     await sessions.insertOne({ username: username, action: action, timestamp: new Date() });
-    // } finally {
-    //     await client.close();
-    // }
-}
-
-radiusServer.on('message', async (msg, rinfo) => {
-    const packet = radius.decode({ packet: msg, secret: getRadiusSecret() });
-
-    // Check if the packet is from RADIUS
-    if (!packet) {
-        console.log('Non-RADIUS packet received, ignoring.');
-        return;
-    }
-
-    console.log('RADIUS packet received:', packet);
-
-    // Handle Access-Request
-    if (packet.code === 'Access-Request') {
-        const username = packet.attributes['User-Name'];
-        const password = packet.attributes['User-Password'];
-
-        if (users[username] && users[username] === password) {
-            await logSession(username, 'login');
-            console.log('User logged in:', username);
-        } else {
-            console.log('Access-Reject for user:', username);
-        }
-    }
-
-    // Handle Accounting-Request
-    if (packet.code === 'Accounting-Request') {
-        const username = packet.attributes['User-Name'];
-        const action = packet.attributes['Acct-Status-Type'];
-
-        await logSession(username, action);
-        console.log('Accounting action:', action, 'for user:', username);
-    }
-});
-
-//radiusServer.bind(1812);
 
 const swaggerOptions = {
     swaggerDefinition: {
@@ -397,6 +343,10 @@ initializeDB().then(async () => {
     startDailyRevenueSnapshotScheduler();
     startMonthlyQuotaResetScheduler();
     startAlertEscalationScheduler();
+    void startReportScheduleScheduler();
+    startTicketSlaScheduler();
+    sessionWatcher.start();
+    console.log("[ws] session metrics broadcaster started (single shared timer)");
     voucherService.init().catch((e) => console.warn("[vouchers] cache init failed (non-fatal):", e));
 
     // Ensure ClickHouse flow-log schema (rollup table + materialized view) exists.
@@ -500,6 +450,15 @@ async function shutdown(signal: string) {
     } catch {}
     try {
       stopAlertEscalationScheduler();
+    } catch {}
+    try {
+      stopReportScheduleScheduler();
+    } catch {}
+    try {
+      stopTicketSlaScheduler();
+    } catch {}
+    try {
+      sessionWatcher.stop();
     } catch {}
 
     // Stop accepting new HTTP connections
