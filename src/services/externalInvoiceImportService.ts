@@ -1,4 +1,4 @@
-import { IsNull } from 'typeorm';
+import { IsNull, Raw } from 'typeorm';
 import { AppDataSource } from '../db/config';
 import { ExternalInvoice } from '../db/entities/ExternalInvoice';
 import type { ImportPreviewResult } from './externalInvoiceImportParser';
@@ -96,7 +96,29 @@ export async function importExternalInvoices(
     await enrichExternalInvoicesFromUserDetails(filteredInvoices);
 
   const repo = AppDataSource.getRepository(ExternalInvoice);
-  const currentRows = await repo.find({ where: { deletedAt: IsNull() } });
+
+  // Both inheritance helpers below only ever match rows belonging to the
+  // accounts present in this batch (they compare the username + provider pair),
+  // so the lookup can be bounded by username instead of loading the whole
+  // invoice table into memory on every import.
+  const incomingUsernames = Array.from(
+    new Set(
+      filteredInvoices
+        .map((inv) => String(inv.username ?? '').trim().toLowerCase())
+        .filter(Boolean)
+    )
+  );
+  const currentRows = incomingUsernames.length
+    ? await repo.find({
+        where: {
+          deletedAt: IsNull(),
+          // Case-insensitive: account matching lowercases both sides of the pair.
+          username: Raw((alias) => `LOWER(${alias}) IN (:...usernames)`, {
+            usernames: incomingUsernames,
+          }),
+        },
+      })
+    : [];
 
   const { invoices: withCarryover, added: inheritedCarryoverLines } =
     inheritCarryoverLinesFromPriorMonth(filteredInvoices, currentRows);

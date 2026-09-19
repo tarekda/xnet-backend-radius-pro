@@ -1,6 +1,6 @@
 // src/services/invoice.service.ts
 import { AppDataSource } from '../db/config';
-import { EntityManager, In, IsNull, SelectQueryBuilder } from 'typeorm';
+import { EntityManager, In, IsNull, Raw, SelectQueryBuilder } from 'typeorm';
 import { Raduserprofile } from "../db/entities/Raduserprofile";
 import { Invoices } from "../db/entities/Invoices";
 import { startOfMonth } from "date-fns";
@@ -1081,7 +1081,20 @@ export const upsertExternalInvoices = async (
     options?: { scopedBillingMonths?: string[]; scopedProviders?: string[]; actorUsername?: string }
 ): Promise<UpsertExternalInvoicesResult> => {
     const repo = AppDataSource.getRepository(ExternalInvoice);
-    const current = await repo.find({ where: { deletedAt: IsNull() } });
+
+    // The composite key includes the billing month, so a row can only ever be
+    // updated or soft-deleted when its month is in play. Bound the lookup by
+    // month rather than loading the whole invoice table on every import.
+    const scopedMonths = (options?.scopedBillingMonths ?? []).map((m) => normalizeBillingMonthKey(m));
+    const incomingMonths = incoming
+        .filter((item) => String(item.username ?? '').trim())
+        .map((item) => normalizeBillingMonthKey(item.billingMonth as string));
+    const monthsToFetch = Array.from(new Set([...scopedMonths, ...incomingMonths]));
+
+    const current =
+        monthsToFetch.length > 0
+            ? await repo.find({ where: { deletedAt: IsNull(), billingMonth: In(monthsToFetch) } })
+            : [];
 
     const existingByKey = new Map<string, ExternalInvoice>();
     for (const row of current) {
@@ -1150,7 +1163,6 @@ export const upsertExternalInvoices = async (
     }
 
     let removedFromScope = 0;
-    const scopedMonths = (options?.scopedBillingMonths ?? []).map((m) => normalizeBillingMonthKey(m));
     const scopedProviders = (options?.scopedProviders ?? [])
         .map((provider) => String(provider).trim().toLowerCase())
         .filter(Boolean);
@@ -1310,7 +1322,16 @@ export const createExternalInvoiceDebit = async (input: {
         provider,
         debitLabel: label,
     } as ExternalInvoice);
-    const existing = await repo.find({ where: { deletedAt: IsNull() } });
+    // Only this customer's rows can be a duplicate, and the due-date
+    // inheritance below only ever reads this customer's history, so there is no
+    // need to pull the whole table.
+    const existing = await repo.find({
+        where: {
+            deletedAt: IsNull(),
+            // Case-insensitive to match how the composite key compares usernames.
+            username: Raw((alias) => `LOWER(${alias}) = :username`, { username: username.toLowerCase() }),
+        },
+    });
     const duplicate = existing.find((row) => externalInvoiceCompositeKey(row) === composite);
     if (duplicate) {
         throw new Error(`A payment line "${label}" already exists for this customer and billing month`);

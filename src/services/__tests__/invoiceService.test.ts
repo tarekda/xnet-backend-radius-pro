@@ -360,4 +360,22 @@ describe('upsertExternalInvoices', () => {
         const removed = repo.softRemove.mock.calls[0][0] as ExternalInvoice[];
         expect(removed.map((row) => row.id)).toEqual([10]);
     });
+
+    it('bounds the lookup to the billing months involved instead of the whole table', async () => {
+        const repo = mockRepo([]);
+
+        await upsertExternalInvoices(
+            [invoice({ username: 'kept-user', billingMonth: '2026-08-01' })],
+            { scopedBillingMonths: ['2026-07-01'] }
+        );
+
+        const where = repo.find.mock.calls[0][0].where as {
+            deletedAt: unknown;
+            billingMonth: { value: string[] };
+        };
+        expect(where.deletedAt).toBeDefined();
+        expect(where.billingMonth.value).toEqual(
+            expect.arrayContaining(['2026-07-01', '2026-08-01'])
+        );
+    });
 });

@@ -526,7 +526,7 @@ export const generateInvoicesHandler = async (_: Request, res: Response) => {
 export const getInvoicesHandler = async (_req: Request, res: Response) => {
   try {
     const page = parseInt(_req.query.page as string) || 1;
-    const limit = parseInt(_req.query.limit as string) || 10;
+    const limit = Math.min(500, Math.max(1, parseIntOrDefault(_req.query.limit, 10)));
     const search = (_req.query.search as string) || '';
     const dateFrom = _req.query.dateFrom as string;
     const dateTo = _req.query.dateTo as string;
@@ -761,7 +761,7 @@ export const getCollectorBreakdownHandler = async (req: Request, res: Response) 
 export const getCollectedInvoicesListHandler = async (req: Request, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 10;
+    const limit = Math.min(500, Math.max(1, parseIntOrDefault(req.query.limit, 10)));
     const { dateFrom, dateTo } = req.query as { dateFrom?: string; dateTo?: string };
     const list = await getCollectedInvoicesList(page, limit, dateFrom, dateTo);
     sendResponse(res, true, 200, "Collected invoices fetched", list);
@@ -1177,7 +1177,7 @@ export const createExternalInvoiceDebitHandler = async (req: Request, res: Respo
 export const getExternalInvoicesHandler = async (req: Request, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 10;
+    const limit = Math.min(500, Math.max(1, parseIntOrDefault(req.query.limit, 10)));
     const search = req.query.search as string || '';
     const from = (req.query.from as string) || undefined;
     const to = (req.query.to as string) || undefined;
